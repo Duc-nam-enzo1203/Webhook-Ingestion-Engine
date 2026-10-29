@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'webhook-gateway'
+    static_configs:
+      - targets: ['gateway:3000']
+        labels:
+          service: 'ingestion-gateway'
+
+  - job_name: 'webhook-engine-node'
+    static_configs:
+      - targets: ['gateway:3000']
+        labels:
+          role: 'runtime-metrics'
+

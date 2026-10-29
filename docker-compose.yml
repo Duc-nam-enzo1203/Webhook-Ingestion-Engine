@@ -1,0 +1,121 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: webhook-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgrespassword}
+      POSTGRES_DB: ${POSTGRES_DB:-webhook_engine}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-webhook_engine}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: webhook-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory 256mb --maxmemory-policy noeviction
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mock-erp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: webhook-mock-erp
+    command: [ "node", "dist/mock-downstream/server.js" ]
+    environment:
+      NODE_ENV: production
+      MOCK_DOWNSTREAM_PORT: 4000
+      HOST: 0.0.0.0
+    ports:
+      - "4000:4000"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: webhook-gateway
+    restart: unless-stopped
+    command: [ "node", "dist/gateway/server.js" ]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgrespassword}@postgres:5432/${POSTGRES_DB:-webhook_engine}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      STREAM_SHARD_COUNT: 16
+      DOWNSTREAM_URL: http://mock-erp:4000/downstream
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock-erp:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: webhook-worker
+    restart: unless-stopped
+    command: [ "node", "dist/worker/index.js" ]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgrespassword}@postgres:5432/${POSTGRES_DB:-webhook_engine}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      STREAM_SHARD_COUNT: 16
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: webhook-prometheus
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - gateway
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: webhook-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
+  redisdata:
