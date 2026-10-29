@@ -115,17 +115,20 @@ When an `ORDER_CANCELLED` event (weight 99, containing only `{ order_id: 123, ca
 
 ## 🛠️ Admin & DLQ Operations
 
-The engine includes operational endpoints for dead-letter queue management and inspection:
+The engine includes authenticated operational endpoints for dead-letter queue management and safe replay:
 
-* **Inspect Dead-Letter Queue:**
+* **Inspect Dead-Letter Queue (Metadata only, protected by `x-admin-key`):**
   ```bash
-  curl http://localhost:3000/admin/dlq?limit=20
+  curl -H "x-admin-key: admin_secret_super_secure_key" \
+       http://localhost:3000/admin/dlq?limit=20
   ```
 * **Replay Dead-Lettered Event:**
   ```bash
-  curl -X POST http://localhost:3000/admin/dlq/evt_failed_123/replay
+  curl -X POST \
+       -H "x-admin-key: admin_secret_super_secure_key" \
+       http://localhost:3000/admin/dlq/evt_failed_123/replay
   ```
-  *(Atomically resets event delivery state in PostgreSQL and re-enqueues the raw payload to its designated Redis Stream shard).*
+  *(Atomically purges the Redis fast-path idempotency lock `idemp:{tenant}:{platform}:{eventId}`, resets event state in PostgreSQL, queries the canonical state from `entity_states`, and re-enqueues the payload to its designated Redis Stream shard).*
 
 ---
 

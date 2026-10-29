@@ -1,65 +1,96 @@
-# Webhook Ingestion Engine: Benchmark Results & Validation
+# Webhook Ingestion Engine: Benchmark & Load Testing Guide
 
-## 1. Test Environment Specification
-* **Hardware:** 8 Cores / 16 Threads, 16GB RAM, NVMe SSD
-* **OS:** Windows / Linux Docker 2026
-* **Database:** PostgreSQL 16 (Partitioned Tables: `idempotency_keys` HASH, `webhook_events` RANGE)
-* **Message Broker:** Redis 7 (`appendonly yes`, `appendfsync everysec`, 16 Stream Shards)
-* **Gateway:** Fastify 5.2 + Node.js 20 LTS (Raw Buffer HMAC Verifier + Shuffle Sharding)
-* **Load Generator:** `k6 v0.54.0`
+This document outlines the performance benchmarks, methodology, and reproduction steps for the Webhook Ingestion Engine using `k6`.
 
 ---
 
-## 2. Test Scenario 1: Flash Sale Spike (5,000 Webhooks / Minute)
+## 1. Test Methodology & Objectives
+
+The engine is engineered to handle massive burst traffic from e-commerce platforms (Shopify, TikTok Shop, Shopee) without Head-of-Line blocking or data loss. The benchmarks evaluate:
+1. **Ingestion Throughput & Latency:** Ingesting burst webhooks with HMAC-SHA256 verification and buffered queue dispatch.
+2. **Multi-Tenant Isolation:** Ensuring a noisy or misconfigured tenant cannot saturate shared worker capacity or starve other merchants.
+3. **Durability & Resource Bounds:** Verifying safe MINID trimming and bounded memory usage under high sustained volume.
+
+---
+
+## 2. Benchmark Scenarios
+
+### Scenario 1: Flash Sale Spike Ingestion
 * **Script:** `benchmarks/k6-flash-sale-spike.js`
-* **Target:** Ingestion Gateway `POST /webhooks/shopify`
-* **Payload:** Shopify Order Created with realistic line items & HMAC-SHA256 Base64 signature.
+* **Target:** Gateway endpoint `POST /webhooks/shopify`
+* **Target Tenant:** Merchant Alpha (`id: a0000000-0000-0000-0000-000000000001`, `rate_limit_rps = 2000`, `max_concurrency = 50`)
+* **Workload:** Rapid traffic ramp from 100 RPS to 1,500 RPS over 60 seconds with valid HMAC signatures.
+* **Key Verification:**
+  - Gateway responds `202 Accepted` on valid signatures.
+  - Zero 5xx server errors.
+  - Latency p95 and p99 remain sub-50ms when buffering into Redis Streams.
 
-### Results:
-| Metric | Target | Observed | Status |
-| :--- | :--- | :--- | :--- |
-| **Throughput (Peak RPS)** | 1,500 RPS | 1,512 RPS | ✅ Passed |
-| **p95 Latency** | < 25 ms | **7.8 ms** | ✅ Exceeded |
-| **p99 Latency** | < 50 ms | **13.4 ms** | ✅ Exceeded |
-| **HTTP Success Rate (202 Accepted)** | > 99.0% | **100.0%** (Zero 5xx) | ✅ Passed |
-| **Data Dropped via MAXLEN** | 0 records | **0 records** (Safe Trim) | ✅ Passed |
-
----
-
-## 3. Test Scenario 2: Multi-Tenant Noisy Neighbor Isolation
+### Scenario 2: Multi-Tenant Noisy Neighbor Isolation
 * **Script:** `benchmarks/k6-noisy-neighbor.js`
-* **Setup:** 
-  * Tenant A (VIP Merchant): Flooding 1,000 RPS while Downstream ERP response artificially delayed to 3,000ms.
-  * Tenant B (Regular Merchant): Steady 20 RPS with healthy downstream.
-
-### Results:
-* **Tenant A Outcome:** Capped at 30 concurrent worker slots via **ZSET Lease Semaphore**; subsequent requests queued smoothly across assigned shards. Circuit breaker tripped to `OPEN` on downstream timeout, redirecting traffic to delayed retry ZSET.
-* **Tenant B Outcome:** p99 latency remained **< 18ms**. Zero Head-of-Line Blocking observed.
-
----
-
-## 4. Test Scenario 3: Chaos & Duplicate Storm (100% Data Integrity)
-* **Setup:** 50% duplicate event IDs fired simultaneously (`Promise.all` across 20 concurrent threads).
-* **Database Verification:**
-  ```sql
-  -- Verification Query: Check that no duplicate external_event_id exists
-  SELECT tenant_id, platform, event_id, COUNT(*) 
-  FROM idempotency_keys 
-  GROUP BY tenant_id, platform, event_id 
-  HAVING COUNT(*) > 1;
-  -- Result: 0 rows returned (Absolute Zero Duplicates)
-  ```
+* **Target:** Dual-tenant concurrent traffic:
+  - **Tenant A (Burst Merchant):** Flooding at 500+ RPS while downstream ERP is simulated with a 3,000ms latency.
+  - **Tenant B (Steady Merchant):** Constant 20 RPS with a fast, healthy downstream ERP (20ms latency).
+* **Key Verification:**
+  - Tenant A worker slots are capped by its **ZSET Lease Semaphore** (`max_concurrency`), preventing thread exhaustion.
+  - Tenant B experiences **zero Head-of-Line blocking**; its events continue processing smoothly without increased queue lag.
 
 ---
 
-## 5. Test Scenario 4: Out-of-Order Hydration Verification
-* **Setup:** `ORDER_CANCELLED` arrived at 10:05 AM (partial payload). `ORDER_CREATED` arrived at 10:00 AM (full items).
-* **Database Verification:**
-  ```sql
-  SELECT current_state, is_hydrated, merged_payload->>'cancel_reason', jsonb_array_length(merged_payload->'line_items')
-  FROM entity_states
-  WHERE entity_id = 'ORD_E2E_4412';
-  -- Result: CANCELLED | true | "fraud_check_failed" | 1
-  ```
-* **Conclusion:** Order did not resurrect back to `CREATED`; all line items were preserved without loss.
+## 3. Running Benchmarks Locally
 
+### Prerequisites
+1. Start the complete system stack:
+   ```bash
+   make up
+   ```
+2. Ensure [k6](https://k6.io/) is installed on your load generator machine:
+   ```bash
+   # On macOS
+   brew install k6
+
+   # On Linux
+   sudo gpg -k
+   sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+   echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+   sudo apt-get update && sudo apt-get install k6
+   ```
+
+### Execution Commands
+```bash
+# Execute Flash Sale Spike benchmark
+make benchmark
+
+# Or execute specific scenario directly with k6
+k6 run benchmarks/k6-flash-sale-spike.js
+k6 run benchmarks/k6-noisy-neighbor.js
+```
+
+---
+
+## 4. Post-Benchmark Verification Queries
+
+After running the benchmark suite, verify database and stream consistency using PostgreSQL:
+
+```sql
+-- 1. Verify 100% Idempotency (Zero duplicate processed events)
+SELECT tenant_id, platform, event_id, COUNT(*) 
+FROM idempotency_keys 
+GROUP BY tenant_id, platform, event_id 
+HAVING COUNT(*) > 1;
+-- Expected output: 0 rows
+
+-- 2. Verify Delivery Status Distribution
+SELECT delivery_status, COUNT(*) 
+FROM webhook_events 
+GROUP BY delivery_status;
+
+-- 3. Verify Out-of-Order State Preservation
+SELECT current_state, is_hydrated, count(*) 
+FROM entity_states 
+GROUP BY current_state, is_hydrated;
+```
+
+---
+
+> [!NOTE]
+> Physical performance figures (such as exact RPS, p95/p99 latency) depend heavily on host CPU, disk I/O, network latency, and Docker resource limits. Run the reproducible k6 scripts above on your target infrastructure to collect environment-specific metrics.

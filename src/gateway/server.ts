@@ -48,81 +48,175 @@ export async function buildGatewayServer(): Promise<FastifyInstance> {
     return reply.send(await metricsRegistry.metrics());
   });
 
-  // DLQ Admin: Inspect dead-lettered events
-  server.get('/admin/dlq', async (_req: FastifyRequest, reply: FastifyReply) => {
-    try {
-      const pool = getDbPool();
-      const res = await pool.query(
-        `SELECT tenant_id, platform, event_id, entity_type, entity_id, retry_count, last_error, created_at
-         FROM webhook_events 
-         WHERE delivery_status = 'DLQ' 
-         ORDER BY created_at DESC LIMIT 100`
-      );
-      return reply.send({ total: res.rows.length, dlq_events: res.rows });
-    } catch (err: any) {
-      return reply.code(500).send({ error: err.message });
+  // Admin Authentication PreHandler
+  const adminAuthPreHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+    const adminKey = (req.headers['x-admin-key'] as string) || (req.headers.authorization?.replace(/^Bearer\s+/i, ''));
+    if (!adminKey || adminKey !== env.ADMIN_API_KEY) {
+      return reply.code(401).send({ error: 'Unauthorized: Invalid or missing admin authentication key' });
     }
-  });
+  };
 
-  // DLQ Admin: Replay dead-lettered event
-  server.post('/admin/dlq/:eventId/replay', async (req: FastifyRequest<{ Params: { eventId: string } }>, reply: FastifyReply) => {
-    const { eventId } = req.params;
-    try {
-      const pool = getDbPool();
-      const res = await pool.query(
-        `SELECT tenant_id, platform, event_id, raw_payload, entity_type, entity_id
-         FROM webhook_events 
-         WHERE event_id = $1 AND delivery_status = 'DLQ' LIMIT 1`,
-        [eventId]
-      );
+  // DLQ Admin: Inspect dead-lettered events (Protected)
+  server.get<{ Querystring: { tenant_id?: string; limit?: string; include_payload?: string } }>(
+    '/admin/dlq',
+    { preHandler: adminAuthPreHandler },
+    async (req, reply) => {
+      try {
+        const pool = getDbPool();
+        const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+        const tenantId = req.query.tenant_id;
+        const includePayload = req.query.include_payload === 'true';
 
-      if (res.rows.length === 0) {
-        return reply.code(404).send({ error: `Event ${eventId} not found in DLQ` });
+        const queryFields = includePayload
+          ? 'tenant_id, platform, event_id, entity_type, entity_id, retry_count, last_error, raw_payload, created_at'
+          : 'tenant_id, platform, event_id, entity_type, entity_id, retry_count, last_error, created_at';
+
+        let res;
+        if (tenantId) {
+          res = await pool.query(
+            `SELECT ${queryFields} FROM webhook_events 
+             WHERE delivery_status = 'DLQ' AND tenant_id = $1
+             ORDER BY created_at DESC LIMIT $2`,
+            [tenantId, limit]
+          );
+        } else {
+          res = await pool.query(
+            `SELECT ${queryFields} FROM webhook_events 
+             WHERE delivery_status = 'DLQ' 
+             ORDER BY created_at DESC LIMIT $1`,
+            [limit]
+          );
+        }
+        return reply.send({ total: res.rows.length, dlq_events: res.rows });
+      } catch (err: any) {
+        return reply.code(500).send({ error: err.message });
       }
-
-      const event = res.rows[0];
-      await pool.query(
-        `UPDATE webhook_events SET delivery_status = 'QUEUED', retry_count = 0, last_error = NULL WHERE event_id = $1`,
-        [eventId]
-      );
-      await pool.query(
-        `UPDATE idempotency_keys SET status = 'IN_PROGRESS' WHERE event_id = $1`,
-        [eventId]
-      );
-
-      const redis = getRedisClient();
-      const shardSelection = await shuffleShardingRouter.selectShard(event.tenant_id, redis);
-
-      const verifiedEvent: VerifiedWebhookEvent = {
-        tenantId: event.tenant_id,
-        platform: event.platform,
-        eventId: event.event_id,
-        entityType: event.entity_type,
-        entityId: event.entity_id,
-        eventType: 'REPLAY_DLQ',
-        currentState: 'REPLAY',
-        stateWeight: 10,
-        externalVersion: Date.now(),
-        isHydrated: true,
-        payload: event.raw_payload,
-        rawBody: JSON.stringify(event.raw_payload),
-        receivedAt: new Date().toISOString(),
-      };
-
-      await redis.xadd(
-        shardSelection.selectedShard,
-        '*',
-        'event_id', eventId,
-        'tenant_id', event.tenant_id,
-        'platform', event.platform,
-        'data', JSON.stringify(verifiedEvent)
-      );
-
-      return reply.send({ status: 'REPLAYED', event_id: eventId, shard: shardSelection.selectedShard });
-    } catch (err: any) {
-      return reply.code(500).send({ error: err.message });
     }
-  });
+  );
+
+  // DLQ Admin: Replay dead-lettered event (Protected)
+  server.post<{
+    Params: { eventId: string };
+    Querystring: { tenant_id?: string; platform?: string };
+  }>(
+    '/admin/dlq/:eventId/replay',
+    { preHandler: adminAuthPreHandler },
+    async (req, reply) => {
+      const { eventId } = req.params;
+      const { tenant_id: queryTenantId, platform: queryPlatform } = req.query;
+
+      try {
+        const pool = getDbPool();
+
+        // 1. Fetch event from webhook_events
+        let query = `SELECT tenant_id, platform, event_id, raw_payload, entity_type, entity_id
+                     FROM webhook_events 
+                     WHERE event_id = $1 AND delivery_status = 'DLQ'`;
+        const params: any[] = [eventId];
+
+        if (queryTenantId) {
+          params.push(queryTenantId);
+          query += ` AND tenant_id = $${params.length}`;
+        }
+        if (queryPlatform) {
+          params.push(queryPlatform);
+          query += ` AND platform = $${params.length}`;
+        }
+        query += ` LIMIT 1`;
+
+        const res = await pool.query(query, params);
+
+        if (res.rows.length === 0) {
+          return reply.code(404).send({ error: `Event ${eventId} not found in DLQ` });
+        }
+
+        const event = res.rows[0];
+        const { tenant_id: tenantId, platform, entity_type: entityType, entity_id: entityId } = event;
+
+        // 2. Fetch canonical state from entity_states (so ERP receives true current_state and payload, NOT 'REPLAY')
+        let currentState = 'CREATED';
+        let stateWeight = 10;
+        let isHydrated = true;
+        let payload = typeof event.raw_payload === 'string' ? JSON.parse(event.raw_payload) : event.raw_payload;
+
+        const stateRes = await pool.query(
+          `SELECT current_state, state_weight, is_hydrated, merged_payload 
+           FROM entity_states 
+           WHERE tenant_id = $1 AND platform = $2 AND entity_type = $3 AND entity_id = $4`,
+          [tenantId, platform, entityType, entityId]
+        );
+
+        if (stateRes.rows.length > 0) {
+          currentState = stateRes.rows[0].current_state;
+          stateWeight = stateRes.rows[0].state_weight;
+          isHydrated = Boolean(stateRes.rows[0].is_hydrated);
+          payload = typeof stateRes.rows[0].merged_payload === 'string'
+            ? JSON.parse(stateRes.rows[0].merged_payload)
+            : stateRes.rows[0].merged_payload;
+        }
+
+        // 3. Atomically update Postgres webhook_events and idempotency_keys strictly by (tenant_id, platform, event_id)
+        await pool.query(
+          `UPDATE webhook_events 
+           SET delivery_status = 'QUEUED', retry_count = 0, last_error = NULL 
+           WHERE tenant_id = $1 AND platform = $2 AND event_id = $3`,
+          [tenantId, platform, eventId]
+        );
+
+        await pool.query(
+          `UPDATE idempotency_keys 
+           SET status = 'PERSISTED', updated_at = NOW() 
+           WHERE tenant_id = $1 AND platform = $2 AND event_id = $3`,
+          [tenantId, platform, eventId]
+        );
+
+        // 4. CRITICAL FIX: Delete Redis Fast-Path Idempotency Lock!
+        // Previously, 'COMMIT_DONE' kept Redis lock as 'DONE' for 24h, causing immediate DUPLICATE drop upon replay!
+        const redis = getRedisClient();
+        const lockKey = `idemp:${tenantId}:${platform}:${eventId}`;
+        await redis.del(lockKey);
+
+        // 5. Select destination shard via Shuffle Sharding
+        const shardSelection = await shuffleShardingRouter.selectShard(tenantId, redis);
+
+        const verifiedEvent: VerifiedWebhookEvent = {
+          tenantId,
+          platform,
+          eventId,
+          entityType,
+          entityId,
+          eventType: `${entityType.toLowerCase()}/replay`,
+          currentState,
+          stateWeight,
+          externalVersion: Date.now(),
+          isHydrated,
+          payload,
+          rawBody: JSON.stringify(payload),
+          receivedAt: new Date().toISOString(),
+        };
+
+        await redis.xadd(
+          shardSelection.selectedShard,
+          '*',
+          'event_id', eventId,
+          'tenant_id', tenantId,
+          'platform', platform,
+          'data', JSON.stringify(verifiedEvent)
+        );
+
+        return reply.send({
+          status: 'REPLAYED',
+          event_id: eventId,
+          tenant_id: tenantId,
+          platform,
+          shard: shardSelection.selectedShard,
+          current_state: currentState,
+        });
+      } catch (err: any) {
+        return reply.code(500).send({ error: err.message });
+      }
+    }
+  );
 
   // Main Webhook Ingestion Gateway Endpoint
   server.post('/webhooks/:platform', async (req: FastifyRequest<{ Params: { platform: string }; Querystring: { tenant_id?: string } }>, reply: FastifyReply) => {

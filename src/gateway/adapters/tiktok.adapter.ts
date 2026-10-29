@@ -6,8 +6,8 @@ export class TikTokAdapter implements WebhookPlatformAdapter {
   readonly platform = 'tiktok' as const;
 
   async verifySignature(req: RawWebhookRequest, secret: string): Promise<boolean> {
-    const signature = 
-      req.headers['authorization'] || 
+    const signature =
+      req.headers['authorization'] ||
       (req.query['sign'] as string | undefined);
 
     if (!signature || typeof signature !== 'string') {
@@ -51,9 +51,9 @@ export class TikTokAdapter implements WebhookPlatformAdapter {
     }
 
     const deterministicHash = crypto.createHash('sha256').update(`${req.path}:${rawString}`).digest('hex').substring(0, 16);
-    const eventId = 
-      payload.tts_notification_id || 
-      payload.event_id || 
+    const eventId =
+      payload.tts_notification_id ||
+      payload.event_id ||
       `tiktok_${payload.data?.order_id || 'order'}_${deterministicHash}`;
 
     const data = payload.data || payload;

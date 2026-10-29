@@ -59,3 +59,4 @@ describe('SafeStreamTrimmer Unit Tests', () => {
     expect(trimmed).toBe(0);
   });
 });
+

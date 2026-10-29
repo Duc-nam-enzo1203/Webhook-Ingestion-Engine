@@ -1,6 +1,34 @@
 import { Redis } from 'ioredis';
 import { logger } from '../../shared/observability/logger.js';
 
+export interface DeferredRetryPayload {
+  streamKey: string;
+  rawPayload: {
+    event_id: string;
+    tenant_id: string;
+    platform: string;
+    data: string;
+    defer_count?: number;
+  };
+  scheduledAt: number;
+}
+
+/**
+ * Lua script for Atomic Claim from Delayed Retry ZSET:
+ * Atomically inspects due items (score <= now), removes them from the ZSET,
+ * and returns them. This guarantees that concurrent workers NEVER claim
+ * or duplicate the same retry item.
+ */
+const ATOMIC_CLAIM_LUA = `
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+if #due > 0 then
+  for _, member in ipairs(due) do
+    redis.call('ZREM', KEYS[1], member)
+  end
+end
+return due
+`;
+
 export class DelayedRetryScheduler {
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
@@ -22,32 +50,59 @@ export class DelayedRetryScheduler {
     }
   }
 
-  async schedule(redis: Redis, streamKey: string, rawPayload: any, delayMs: number): Promise<void> {
+  async schedule(
+    redis: Redis,
+    streamKey: string,
+    rawPayload: { event_id: string; tenant_id: string; platform: string; data: string; defer_count?: number },
+    delayMs: number
+  ): Promise<void> {
     const executeAt = Date.now() + delayMs;
-    const item = JSON.stringify({
+    const item: DeferredRetryPayload = {
       streamKey,
       rawPayload,
       scheduledAt: Date.now(),
-    });
+    };
     try {
-      await redis.zadd(this.retryKey, executeAt, item);
+      await redis.zadd(this.retryKey, executeAt, JSON.stringify(item));
     } catch (err) {
-      logger.error({ err }, 'Failed to add item to delayed retry ZSET');
+      logger.error({ err, eventId: rawPayload.event_id }, 'Failed to add item to delayed retry ZSET');
     }
   }
 
-  async processDueRetries(redis: Redis): Promise<void> {
+  /**
+   * Atomically claims and re-enqueues due items into their respective Redis Stream shards.
+   * If XADD fails for any reason, the item is restored to the ZSET to guarantee zero loss.
+   */
+  async processDueRetries(redis: Redis, batchSize = 50): Promise<number> {
     const now = Date.now();
+    let replayedCount = 0;
+
     try {
-      // Fetch up to 50 items whose scheduled execution time has arrived
-      const dueItems = (await redis.zrangebyscore(this.retryKey, '-inf', now, 'LIMIT', 0, 50)) as string[];
-      if (!dueItems || dueItems.length === 0) return;
+      // 1. Atomic claim via Lua script: ZRANGEBYSCORE + ZREM in a single atomic step
+      const dueItems = (await redis.eval(
+        ATOMIC_CLAIM_LUA,
+        1,
+        this.retryKey,
+        now,
+        batchSize
+      )) as string[];
+
+      if (!dueItems || !Array.isArray(dueItems) || dueItems.length === 0) {
+        return 0;
+      }
 
       for (const itemStr of dueItems) {
+        let item: DeferredRetryPayload;
         try {
-          const item = JSON.parse(itemStr);
-          const { streamKey, rawPayload } = item;
+          item = JSON.parse(itemStr);
+        } catch {
+          // Unparseable corrupt item, safe to drop
+          continue;
+        }
 
+        const { streamKey, rawPayload } = item;
+
+        try {
           // Re-append to the stream shard
           await redis.xadd(
             streamKey,
@@ -57,16 +112,18 @@ export class DelayedRetryScheduler {
             'platform', rawPayload.platform,
             'data', rawPayload.data
           );
-
-          // Remove from ZSET once re-queued
-          await redis.zrem(this.retryKey, itemStr);
-        } catch {
-          await redis.zrem(this.retryKey, itemStr);
+          replayedCount++;
+        } catch (xaddErr) {
+          logger.error({ err: xaddErr, eventId: rawPayload.event_id, streamKey }, 'Failed to XADD replayed item, restoring to ZSET');
+          // Re-schedule with 2-second backoff so retry is not lost
+          await redis.zadd(this.retryKey, Date.now() + 2000, itemStr).catch(() => {});
         }
       }
     } catch (err) {
       logger.debug({ err }, 'Error in delayed retry loop');
     }
+
+    return replayedCount;
   }
 }
 

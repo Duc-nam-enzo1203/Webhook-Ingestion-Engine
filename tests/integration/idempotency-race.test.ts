@@ -99,6 +99,7 @@ describe('Integration: Idempotency Race Condition Protection', () => {
         }
         return 1;
       }),
+      zadd: vi.fn().mockResolvedValue(1),
     } as any;
 
     // Fire 20 requests simultaneously across different worker instances in the cluster
@@ -110,7 +111,9 @@ describe('Integration: Idempotency Race Condition Protection', () => {
     const results = await Promise.all(promises);
 
     const successfulDispatches = results.filter((r) => r.status === 'SUCCESS');
-    const blockedDuplicates = results.filter((r) => r.status === 'DUPLICATE' || r.status === 'IN_FLIGHT');
+    const blockedDuplicates = results.filter(
+      (r) => r.status === 'DUPLICATE' || r.status === 'IN_FLIGHT' || (r.status === 'DEFERRED' && r.reason === 'IN_FLIGHT')
+    );
 
     expect(successfulDispatches.length).toBe(1);
     expect(blockedDuplicates.length).toBe(19);

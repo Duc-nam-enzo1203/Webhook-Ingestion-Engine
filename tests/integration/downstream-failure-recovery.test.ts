@@ -178,7 +178,8 @@ describe('Downstream Failure & Two-Phase Durability Recovery', () => {
 
     const result = await processor.processEvent(redis, 'stream:webhooks:00', '1-0', payload);
 
-    expect(result.status).toBe('FAILED_RETRY');
+    expect(result.status).toBe('DEFERRED');
+    expect(result.reason).toBe('FAILED_RETRY');
     expect(result.error).toContain('Downstream returned HTTP 500');
 
     // Data in DB is PERSISTED (not COMPLETED), event is marked RETRYING with retry_count = 1
@@ -314,5 +315,43 @@ describe('Downstream Failure & Two-Phase Durability Recovery', () => {
     expect(mockDb.idempotencyKeys.get(`${tenantId}:shopify:${eventId}`)?.status).toBe('DLQ');
     expect(mockDb.webhookEvents.get(`${tenantId}:shopify:${eventId}`)?.delivery_status).toBe('DLQ');
     expect(redis.zadd).not.toHaveBeenCalled(); // No retry scheduled for client error
+  });
+
+  it('delivers late ORDER_CREATED to ERP with state CANCELLED when new hydration information arrives', async () => {
+    const redis = createMockRedis();
+    const eventId = 'evt_late_created_hydrated';
+    const payload = {
+      event_id: eventId,
+      tenant_id: tenantId,
+      platform: 'shopify',
+      data: JSON.stringify({
+        tenantId,
+        platform: 'shopify',
+        eventId,
+        entityType: 'ORDER',
+        entityId: 'ORD_LATE_HYDRATE',
+        eventType: 'orders/create',
+        currentState: 'CREATED',
+        stateWeight: 10,
+        externalVersion: Date.now() - 10000,
+        isHydrated: true,
+        payload: { id: 'ORD_LATE_HYDRATE', line_items: [{ name: 'Item Alpha' }] },
+        rawBody: '{}',
+        receivedAt: new Date().toISOString(),
+      }),
+    };
+
+    let dispatchedPayload: any = null;
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url, opts) => {
+      dispatchedPayload = JSON.parse(opts.body);
+      return { ok: true, status: 200, text: async () => 'OK' };
+    }));
+
+    const result = await processor.processEvent(redis, 'stream:webhooks:00', '5-0', payload);
+
+    expect(result.status).toBe('SUCCESS');
+    expect(dispatchedPayload).not.toBeNull();
+    // Delivery was made to ERP because isHydrated was true on an existing entity
+    expect(dispatchedPayload.entity_id).toBe('ORD_LATE_HYDRATE');
   });
 });

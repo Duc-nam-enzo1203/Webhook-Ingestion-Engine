@@ -29,6 +29,9 @@ const envSchema = z.object({
   MAX_STREAM_QUEUE_LENGTH: z.coerce.number().default(50000),
   CIRCUIT_BREAKER_ERROR_THRESHOLD: z.coerce.number().default(50), // 50%
   CIRCUIT_BREAKER_RESET_TIMEOUT_MS: z.coerce.number().default(30000),
+
+  // Admin API Authentication
+  ADMIN_API_KEY: z.string().default('admin_secret_super_secure_key'),
 });
 
 export type Env = z.infer<typeof envSchema>;

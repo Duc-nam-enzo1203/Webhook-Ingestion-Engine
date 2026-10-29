@@ -73,7 +73,12 @@ export class StreamConsumerPool {
                 const parsed = this.parseStreamFields(fields);
                 if (parsed) {
                   const outcome = await this.processor.processEvent(redis, shardKey, msgId, parsed);
-                  if (outcome.status === 'SUCCESS' || outcome.status === 'DUPLICATE' || outcome.status === 'DLQ') {
+                  if (
+                    outcome.status === 'SUCCESS' ||
+                    outcome.status === 'DUPLICATE' ||
+                    outcome.status === 'DLQ' ||
+                    outcome.status === 'DEFERRED'
+                  ) {
                     await redis.xack(shardKey, this.groupName, msgId);
                   }
                 }
@@ -137,7 +142,12 @@ export class StreamConsumerPool {
                 const parsed = this.parseStreamFields(fields);
                 if (parsed) {
                   const outcome = await this.processor.processEvent(redis, shardKey, msgId, parsed);
-                  if (outcome.status === 'SUCCESS' || outcome.status === 'DUPLICATE' || outcome.status === 'DLQ') {
+                  if (
+                    outcome.status === 'SUCCESS' ||
+                    outcome.status === 'DUPLICATE' ||
+                    outcome.status === 'DLQ' ||
+                    outcome.status === 'DEFERRED'
+                  ) {
                     await redis.xack(shardKey, this.groupName, msgId);
                   }
                 }

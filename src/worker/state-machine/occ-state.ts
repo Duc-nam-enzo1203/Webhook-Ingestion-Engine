@@ -8,6 +8,7 @@ export interface OccUpsertResult {
   isInserted: boolean;
   isStateAdvanced: boolean;
   isStaleIgnored: boolean;
+  isNewlyHydrated: boolean;
 }
 
 export const OCC_STATE_UPSERT_SQL = `
@@ -71,14 +72,16 @@ export function simulateOccMerge(
       isInserted: true,
       isStateAdvanced: true,
       isStaleIgnored: false,
+      isNewlyHydrated: false,
     };
   }
 
-  const isIncomingNewer = 
+  const isIncomingNewer =
     incoming.stateWeight > existing.stateWeight ||
     (incoming.stateWeight === existing.stateWeight && incoming.externalVersion > existing.externalVersion);
 
   const finalState = isIncomingNewer ? incoming.currentState : existing.currentState;
+  const isNewlyHydrated = incoming.isHydrated && !existing.isHydrated;
   const finalHydrated = existing.isHydrated || incoming.isHydrated;
 
   // Bidirectional merge: newer record is on the right of || operator
@@ -101,6 +104,7 @@ export function simulateOccMerge(
     isInserted: false,
     isStateAdvanced: isIncomingNewer,
     isStaleIgnored: isStale,
+    isNewlyHydrated,
   };
 }
 
@@ -122,13 +126,18 @@ export async function executeOccStateUpsert(
 
   const row = res.rows[0];
   const isStale = Boolean(row.is_stale_ignored);
+  const isInserted = Boolean(row.is_inserted);
+  const isHydrated = Boolean(row.is_hydrated);
+  // An event brought new hydration if it was hydrated and merged into an existing entity
+  const isNewlyHydrated = event.isHydrated && !isInserted;
+
   return {
     currentState: row.current_state,
-    isHydrated: Boolean(row.is_hydrated),
+    isHydrated,
     mergedPayload: typeof row.merged_payload === 'string' ? JSON.parse(row.merged_payload) : row.merged_payload,
-    isInserted: Boolean(row.is_inserted),
-    isStateAdvanced: !isStale && !Boolean(row.is_inserted),
+    isInserted,
+    isStateAdvanced: !isStale && !isInserted,
     isStaleIgnored: isStale,
+    isNewlyHydrated,
   };
 }
-

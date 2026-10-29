@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS webhook_events_2026_11 PARTITION OF webhook_events
 CREATE TABLE IF NOT EXISTS webhook_events_2026_12 PARTITION OF webhook_events
     FOR VALUES FROM ('2026-12-01 00:00:00+00') TO ('2027-01-01 00:00:00+00');
 
+-- Default Partition cho các mốc thời gian ngoài 2026 (tránh lỗi insert sau 2027-01-01)
+CREATE TABLE IF NOT EXISTS webhook_events_default PARTITION OF webhook_events DEFAULT;
+
 CREATE INDEX IF NOT EXISTS idx_webhook_events_lookup 
     ON webhook_events (tenant_id, platform, event_id, created_at);
 
@@ -101,8 +104,8 @@ CREATE INDEX IF NOT EXISTS idx_webhook_events_dlq
 -- ============================================================================
 INSERT INTO tenants (id, name, platform, webhook_secret, rate_limit_rps, max_concurrency, downstream_url)
 VALUES 
-    ('a0000000-0000-0000-0000-000000000001', 'Shopify Merchant Alpha', 'shopify', 'shpss_sec_secret_alpha_key_9912', 150, 10, 'http://localhost:4000/downstream/alpha'),
+    ('a0000000-0000-0000-0000-000000000001', 'Shopify Merchant Alpha', 'shopify', 'shpss_sec_secret_alpha_key_9912', 2000, 50, 'http://localhost:4000/downstream/alpha'),
     ('b0000000-0000-0000-0000-000000000002', 'TikTok Shop Beta', 'tiktok', 'tt_secret_beta_key_7781', 100, 10, 'http://localhost:4000/downstream/beta'),
-    ('c0000000-0000-0000-0000-000000000003', 'Shopee Store Gamma', 'shopee', 'shopee_secret_gamma_key_1123', 200, 15, 'http://localhost:4000/downstream/gamma')
+    ('c0000000-0000-0000-0000-000000000003', 'Shopee Store Gamma', 'shopee', 'shopee_secret_gamma_key_1123', 300, 20, 'http://localhost:4000/downstream/gamma')
 ON CONFLICT (id) DO NOTHING;
 

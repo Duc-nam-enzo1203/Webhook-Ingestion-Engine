@@ -112,7 +112,8 @@ describe('Integration: Multi-Tenant Noisy Neighbor Isolation', () => {
     expect(resA1.status).toBe('SUCCESS');
     expect(resA2.status).toBe('SUCCESS');
     expect(resA3.status).toBe('SUCCESS');
-    expect(resA4.status).toBe('SEMAPHORE_FULL'); // Isolated!
+    expect(resA4.status).toBe('DEFERRED'); // Defer and ACK to prevent PEL message multiplication!
+    expect(resA4.reason).toBe('SEMAPHORE_FULL');
 
     // 2. Tenant B fires a request while Tenant A is full
     const resB1 = await processor.processEvent(mockRedis, 's:01', '5', makePayload(tenantB.id, 'wh_b1'));
