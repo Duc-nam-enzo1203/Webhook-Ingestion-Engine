@@ -15,49 +15,49 @@
 
 ```mermaid
 graph TD
-    subgraph External Platforms
-        A1[Shopify Webhooks]
-        A2[TikTok Shop Webhooks]
-        A3[Shopee Webhooks]
+    subgraph External_Platforms["External Platforms"]
+        A1["Shopify Webhooks"]
+        A2["TikTok Shop Webhooks"]
+        A3["Shopee Webhooks"]
     end
 
-    subgraph Ingestion Gateway (Fastify)
-        B1[Raw Body HMAC Verifier<br/>crypto.timingSafeEqual]
-        B2[Multi-Tier Tenant Cache<br/>L1 In-Memory + L2 Redis + Pub/Sub]
-        B3[Token Bucket Rate Limiter<br/>Redis Lua]
-        B4[Shuffle Sharding Router<br/>Power of Two Choices]
+    subgraph Ingestion_Gateway["Ingestion Gateway (Fastify)"]
+        B1["Raw Body HMAC Verifier<br/>crypto.timingSafeEqual"]
+        B2["Multi-Tier Tenant Cache<br/>L1 In-Memory + L2 Redis + Pub/Sub"]
+        B3["Token Bucket Rate Limiter<br/>Redis Lua"]
+        B4["Shuffle Sharding Router<br/>Power of Two Choices"]
     end
 
-    subgraph Messaging Buffer (Redis Streams)
-        S0[Shard 00]
-        S1[Shard 01]
-        SN[Shard 15]
-        PEL[Background XAUTOCLAIM Loop<br/>Zombie PEL Rescue]
+    subgraph Messaging_Buffer["Messaging Buffer (Redis Streams)"]
+        S0["Shard 00"]
+        S1["Shard 01"]
+        SN["Shard 15"]
+        PEL["Background XAUTOCLAIM Loop<br/>Zombie PEL Rescue"]
     end
 
-    subgraph Worker Pool
-        W1[Worker 1]
-        W2[Worker 2]
-        WN[Worker N]
+    subgraph Worker_Pool["Worker Pool"]
+        W1["Worker 1"]
+        W2["Worker 2"]
+        WN["Worker N"]
     end
 
-    subgraph State & Durability
-        L1[(Redis: Two-Phase Lease Lock<br/>LOCKED vs DONE)]
-        L2[(Redis: ZSET Semaphore<br/>Crash-Safe Tenant Concurrency)]
-        DB1[(PostgreSQL: idempotency_keys<br/>PARTITION BY HASH)]
-        DB2[(PostgreSQL: entity_states<br/>Weighted FSM + JSONB Hydration)]
-        DB3[(PostgreSQL: webhook_events<br/>PARTITION BY RANGE)]
+    subgraph State_Durability["State & Durability"]
+        L1[("Redis: Two-Phase Lease Lock<br/>LOCKED vs DONE")]
+        L2[("Redis: ZSET Semaphore<br/>Crash-Safe Tenant Concurrency")]
+        DB1[("PostgreSQL: idempotency_keys<br/>PARTITION BY HASH")]
+        DB2[("PostgreSQL: entity_states<br/>Weighted FSM + JSONB Hydration")]
+        DB3[("PostgreSQL: webhook_events<br/>PARTITION BY RANGE")]
     end
 
-    subgraph Downstream
-        ERP[Downstream ERP / WMS API<br/>X-Idempotency-Key Header]
+    subgraph Downstream_Services["Downstream"]
+        ERP["Downstream ERP / WMS API<br/>X-Idempotency-Key Header"]
     end
 
     A1 & A2 & A3 -->|POST /webhooks/:platform| B1
     B1 --> B2 --> B3 --> B4
-    B4 -->|XADD Shorter Shard -> 202 Accepted < 15ms| S0 & S1 & SN
+    B4 -->|"XADD Shorter Shard -> 202 Accepted < 15ms"| S0 & S1 & SN
     S0 & S1 & SN -->|XREADGROUP| W1 & W2 & WN
-    PEL -.->|Rescue Stale Messages| W1 & W2 & WN
+    PEL -.->|"Rescue Stale Messages"| W1 & W2 & WN
     W1 & W2 & WN <--> L1 & L2
     W1 & W2 & WN <--> DB1 & DB2 & DB3
     W1 & W2 & WN -->|Dispatch| ERP
