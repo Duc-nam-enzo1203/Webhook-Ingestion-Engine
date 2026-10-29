@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { RawWebhookRequest, VerifiedWebhookEvent, WebhookPlatformAdapter } from './types.js';
 import { calculateHmac, timingSafeEqualString } from './crypto-utils.js';
 
@@ -17,11 +18,18 @@ export class ShopifyAdapter implements WebhookPlatformAdapter {
   async extractEvent(req: RawWebhookRequest): Promise<VerifiedWebhookEvent> {
     const topic = (req.headers['x-shopify-topic'] as string) || 'orders/create';
     const rawString = req.rawBody.toString('utf8');
-    const payload = JSON.parse(rawString);
 
+    let payload: any;
+    try {
+      payload = JSON.parse(rawString);
+    } catch {
+      throw new Error('Malformed JSON in Shopify webhook body');
+    }
+
+    const deterministicHash = crypto.createHash('sha256').update(`${topic}:${rawString}`).digest('hex').substring(0, 16);
     const eventId = 
       (req.headers['x-shopify-webhook-id'] as string) || 
-      `shopify_${payload.id}_${topic}_${Date.now()}`;
+      `shopify_${payload.id || 'order'}_${deterministicHash}`;
       
     const entityId = String(payload.id || payload.order_id || 'unknown_order');
 

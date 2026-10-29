@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id UUID NOT NULL,
     platform VARCHAR(32) NOT NULL,
     event_id VARCHAR(128) NOT NULL,
-    status VARCHAR(20) NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')),
+    status VARCHAR(20) NOT NULL CHECK (status IN ('IN_PROGRESS', 'PERSISTED', 'COMPLETED', 'FAILED', 'DLQ')),
     locked_by VARCHAR(64),
     locked_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

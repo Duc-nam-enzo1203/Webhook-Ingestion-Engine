@@ -4,6 +4,8 @@ import { logger } from '../../shared/observability/logger.js';
 import { getRedisClient } from '../../shared/db/redis.js';
 import { WebhookProcessor } from '../processor.js';
 import { streamBacklogRecords } from '../../shared/observability/metrics.js';
+import { safeStreamTrimmer } from '../trimmer/stream-trimmer.js';
+import { delayedRetryScheduler } from '../resilience/delayed-retry.js';
 
 export class StreamConsumerPool {
   private readonly groupName = 'webhook_workers';
@@ -26,7 +28,6 @@ export class StreamConsumerPool {
       try {
         await redis.xgroup('CREATE', shardKey, this.groupName, '$', 'MKSTREAM');
       } catch (err: any) {
-        // BUSYGROUP Consumer Group name already exists - completely normal
         if (!err.message?.includes('BUSYGROUP')) {
           logger.warn({ err, shardKey }, 'Could not create consumer group');
         }
@@ -48,7 +49,6 @@ export class StreamConsumerPool {
       for (let i = 0; i < env.STREAM_SHARD_COUNT; i++) {
         const shardKey = `${env.STREAM_PREFIX}:${String(i).padStart(2, '0')}`;
         try {
-          // XAUTOCLAIM <key> <group> <consumer> <min-idle-time> <start> [COUNT count]
           const res = (await redis.xautoclaim(
             shardKey,
             this.groupName,
@@ -66,17 +66,19 @@ export class StreamConsumerPool {
               '⚠️ Rescued zombie messages from PEL via XAUTOCLAIM'
             );
 
-            for (const item of claimedMessages) {
-              const msgId = item[0];
-              const fields = item[1];
-              const parsed = this.parseStreamFields(fields);
-              if (parsed) {
-                const outcome = await this.processor.processEvent(redis, shardKey, msgId, parsed);
-                if (outcome.status === 'SUCCESS' || outcome.status === 'DUPLICATE') {
-                  await redis.xack(shardKey, this.groupName, msgId);
+            await Promise.allSettled(
+              claimedMessages.map(async (item: any) => {
+                const msgId = item[0];
+                const fields = item[1];
+                const parsed = this.parseStreamFields(fields);
+                if (parsed) {
+                  const outcome = await this.processor.processEvent(redis, shardKey, msgId, parsed);
+                  if (outcome.status === 'SUCCESS' || outcome.status === 'DUPLICATE' || outcome.status === 'DLQ') {
+                    await redis.xack(shardKey, this.groupName, msgId);
+                  }
                 }
-              }
-            }
+              })
+            );
           }
         } catch {
           // Ignore intermittent recovery errors
@@ -86,7 +88,7 @@ export class StreamConsumerPool {
   }
 
   /**
-   * Main Read Loop across all stream shards
+   * Main Read Loop across all stream shards with bounded concurrency
    */
   async start(): Promise<void> {
     this.isRunning = true;
@@ -94,6 +96,12 @@ export class StreamConsumerPool {
 
     await this.initConsumerGroups(redis);
     this.startAutoclaimLoop(redis);
+
+    // Start Safe MINID Trimmer (runs every 10s)
+    safeStreamTrimmer.start(redis, 10000);
+
+    // Start Delayed Retry Loop (runs every 1s)
+    delayedRetryScheduler.start(redis, 1000);
 
     logger.info({ workerId: this.workerId }, '🚀 Stream Consumer Worker Pool started');
 
@@ -106,7 +114,6 @@ export class StreamConsumerPool {
 
     while (this.isRunning) {
       try {
-        // XREADGROUP GROUP <group> <consumer> [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] ID [ID ...]
         const streams = (await redis.xreadgroup(
           'GROUP',
           this.groupName,
@@ -124,15 +131,18 @@ export class StreamConsumerPool {
           for (const [shardKey, messages] of streams) {
             streamBacklogRecords.set({ shard: shardKey }, messages.length);
 
-            for (const [msgId, fields] of messages) {
-              const parsed = this.parseStreamFields(fields);
-              if (parsed) {
-                const outcome = await this.processor.processEvent(redis, shardKey, msgId, parsed);
-                if (outcome.status === 'SUCCESS' || outcome.status === 'DUPLICATE') {
-                  await redis.xack(shardKey, this.groupName, msgId);
+            // Process all messages in batch concurrently, bounded by per-tenant semaphores
+            await Promise.allSettled(
+              messages.map(async ([msgId, fields]: [string, string[]]) => {
+                const parsed = this.parseStreamFields(fields);
+                if (parsed) {
+                  const outcome = await this.processor.processEvent(redis, shardKey, msgId, parsed);
+                  if (outcome.status === 'SUCCESS' || outcome.status === 'DUPLICATE' || outcome.status === 'DLQ') {
+                    await redis.xack(shardKey, this.groupName, msgId);
+                  }
                 }
-              }
-            }
+              })
+            );
           }
         }
       } catch (err: any) {
@@ -149,6 +159,8 @@ export class StreamConsumerPool {
       clearInterval(this.autoclaimTimer);
       this.autoclaimTimer = null;
     }
+    safeStreamTrimmer.stop();
+    delayedRetryScheduler.stop();
   }
 
   private parseStreamFields(fields: string[]): { event_id: string; tenant_id: string; platform: string; data: string } | null {
@@ -168,7 +180,6 @@ export class StreamConsumerPool {
   }
 }
 
-// Standalone worker entry point
 if (process.argv[1]?.endsWith('consumer.ts') || process.argv[1]?.endsWith('consumer.js')) {
   const pool = new StreamConsumerPool();
   pool.start().catch((err) => {
@@ -176,4 +187,3 @@ if (process.argv[1]?.endsWith('consumer.ts') || process.argv[1]?.endsWith('consu
     process.exit(1);
   });
 }
-

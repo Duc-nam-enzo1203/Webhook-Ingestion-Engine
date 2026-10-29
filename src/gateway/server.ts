@@ -8,9 +8,10 @@ import {
   gatewayLatencyMs 
 } from '../shared/observability/metrics.js';
 import { getPlatformAdapter } from './adapters/index.js';
-import { RawWebhookRequest } from './adapters/types.js';
+import { RawWebhookRequest, VerifiedWebhookEvent } from './adapters/types.js';
 import { tenantCache } from '../shared/cache/tenant-cache.js';
 import { getRedisClient } from '../shared/db/redis.js';
+import { getDbPool } from '../shared/db/postgres.js';
 import { shuffleShardingRouter } from './router/shuffle-sharding.js';
 import { checkTenantRateLimit } from './middlewares/rate-limiter.js';
 import { backpressureChecker } from './middlewares/backpressure.js';
@@ -45,6 +46,82 @@ export async function buildGatewayServer(): Promise<FastifyInstance> {
   server.get('/metrics', async (_req: FastifyRequest, reply: FastifyReply) => {
     reply.header('Content-Type', metricsRegistry.contentType);
     return reply.send(await metricsRegistry.metrics());
+  });
+
+  // DLQ Admin: Inspect dead-lettered events
+  server.get('/admin/dlq', async (_req: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const pool = getDbPool();
+      const res = await pool.query(
+        `SELECT tenant_id, platform, event_id, entity_type, entity_id, retry_count, last_error, created_at
+         FROM webhook_events 
+         WHERE delivery_status = 'DLQ' 
+         ORDER BY created_at DESC LIMIT 100`
+      );
+      return reply.send({ total: res.rows.length, dlq_events: res.rows });
+    } catch (err: any) {
+      return reply.code(500).send({ error: err.message });
+    }
+  });
+
+  // DLQ Admin: Replay dead-lettered event
+  server.post('/admin/dlq/:eventId/replay', async (req: FastifyRequest<{ Params: { eventId: string } }>, reply: FastifyReply) => {
+    const { eventId } = req.params;
+    try {
+      const pool = getDbPool();
+      const res = await pool.query(
+        `SELECT tenant_id, platform, event_id, raw_payload, entity_type, entity_id
+         FROM webhook_events 
+         WHERE event_id = $1 AND delivery_status = 'DLQ' LIMIT 1`,
+        [eventId]
+      );
+
+      if (res.rows.length === 0) {
+        return reply.code(404).send({ error: `Event ${eventId} not found in DLQ` });
+      }
+
+      const event = res.rows[0];
+      await pool.query(
+        `UPDATE webhook_events SET delivery_status = 'QUEUED', retry_count = 0, last_error = NULL WHERE event_id = $1`,
+        [eventId]
+      );
+      await pool.query(
+        `UPDATE idempotency_keys SET status = 'IN_PROGRESS' WHERE event_id = $1`,
+        [eventId]
+      );
+
+      const redis = getRedisClient();
+      const shardSelection = await shuffleShardingRouter.selectShard(event.tenant_id, redis);
+
+      const verifiedEvent: VerifiedWebhookEvent = {
+        tenantId: event.tenant_id,
+        platform: event.platform,
+        eventId: event.event_id,
+        entityType: event.entity_type,
+        entityId: event.entity_id,
+        eventType: 'REPLAY_DLQ',
+        currentState: 'REPLAY',
+        stateWeight: 10,
+        externalVersion: Date.now(),
+        isHydrated: true,
+        payload: event.raw_payload,
+        rawBody: JSON.stringify(event.raw_payload),
+        receivedAt: new Date().toISOString(),
+      };
+
+      await redis.xadd(
+        shardSelection.selectedShard,
+        '*',
+        'event_id', eventId,
+        'tenant_id', event.tenant_id,
+        'platform', event.platform,
+        'data', JSON.stringify(verifiedEvent)
+      );
+
+      return reply.send({ status: 'REPLAYED', event_id: eventId, shard: shardSelection.selectedShard });
+    } catch (err: any) {
+      return reply.code(500).send({ error: err.message });
+    }
   });
 
   // Main Webhook Ingestion Gateway Endpoint
@@ -118,7 +195,7 @@ export async function buildGatewayServer(): Promise<FastifyInstance> {
     // 5. Active Backpressure Check (prevents OOM & blind MAXLEN data drops)
     const backpressure = await backpressureChecker.checkBackpressure(
       redis, 
-      Math.max(shardSelection.lengthA, shardSelection.lengthB)
+      shardSelection.selectedShard
     );
     if (backpressure.overloaded) {
       gatewayRequestsTotal.inc({ platform, status: '503_backpressure' });

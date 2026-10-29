@@ -37,7 +37,10 @@ RETURNING
     current_state, 
     is_hydrated, 
     merged_payload,
-    (xmax = 0) AS is_inserted;
+    (xmax = 0) AS is_inserted,
+    (EXCLUDED.state_weight < entity_states.state_weight OR 
+     (EXCLUDED.state_weight = entity_states.state_weight AND EXCLUDED.external_version < entity_states.external_version)
+    ) AS is_stale_ignored;
 `;
 
 /**
@@ -118,13 +121,14 @@ export async function executeOccStateUpsert(
   ]);
 
   const row = res.rows[0];
+  const isStale = Boolean(row.is_stale_ignored);
   return {
     currentState: row.current_state,
     isHydrated: Boolean(row.is_hydrated),
     mergedPayload: typeof row.merged_payload === 'string' ? JSON.parse(row.merged_payload) : row.merged_payload,
     isInserted: Boolean(row.is_inserted),
-    isStateAdvanced: true,
-    isStaleIgnored: false,
+    isStateAdvanced: !isStale && !Boolean(row.is_inserted),
+    isStaleIgnored: isStale,
   };
 }
 

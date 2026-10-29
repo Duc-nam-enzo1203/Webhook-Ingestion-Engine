@@ -28,7 +28,7 @@ build:
 	npm run build
 
 test:
-	npm run test:unit
+	npm run test
 
 test-unit:
 	npm run test:unit

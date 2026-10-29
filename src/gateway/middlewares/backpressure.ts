@@ -15,15 +15,22 @@ export class BackpressureChecker {
 
   async checkBackpressure(
     redis: Redis,
-    shardQueueLength: number
+    shardKey: string
   ): Promise<BackpressureCheckResult> {
-    // 1. Check shard queue backlog
-    if (shardQueueLength >= env.MAX_STREAM_QUEUE_LENGTH) {
-      return {
-        overloaded: true,
-        reason: `Stream queue depth ${shardQueueLength} exceeds limit ${env.MAX_STREAM_QUEUE_LENGTH}`,
-        retryAfterSec: 30,
-      };
+    // 1. Check true pending backlog depth via XPENDING instead of historical XLEN
+    try {
+      const pendingSummary = (await redis.xpending(shardKey, 'webhook_workers')) as any;
+      const pendingCount = Array.isArray(pendingSummary) ? Number(pendingSummary[0]) : 0;
+
+      if (pendingCount >= env.MAX_STREAM_QUEUE_LENGTH) {
+        return {
+          overloaded: true,
+          reason: `Stream pending backlog ${pendingCount} exceeds threshold ${env.MAX_STREAM_QUEUE_LENGTH}`,
+          retryAfterSec: 30,
+        };
+      }
+    } catch {
+      // If consumer group not initialized yet, allow through
     }
 
     // 2. Periodic Redis Memory Check (every 2s)
@@ -66,4 +73,3 @@ export class BackpressureChecker {
 }
 
 export const backpressureChecker = new BackpressureChecker();
-

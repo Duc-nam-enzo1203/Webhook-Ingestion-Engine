@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { RawWebhookRequest, VerifiedWebhookEvent, WebhookPlatformAdapter } from './types.js';
 import { calculateHmac, timingSafeEqualString } from './crypto-utils.js';
 
@@ -42,12 +43,18 @@ export class TikTokAdapter implements WebhookPlatformAdapter {
 
   async extractEvent(req: RawWebhookRequest): Promise<VerifiedWebhookEvent> {
     const rawString = req.rawBody.toString('utf8');
-    const payload = JSON.parse(rawString);
+    let payload: any;
+    try {
+      payload = JSON.parse(rawString);
+    } catch {
+      throw new Error('Malformed JSON in TikTok webhook body');
+    }
 
+    const deterministicHash = crypto.createHash('sha256').update(`${req.path}:${rawString}`).digest('hex').substring(0, 16);
     const eventId = 
       payload.tts_notification_id || 
       payload.event_id || 
-      `tiktok_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      `tiktok_${payload.data?.order_id || 'order'}_${deterministicHash}`;
 
     const data = payload.data || payload;
     const entityId = String(data.order_id || payload.order_id || 'unknown_order');
