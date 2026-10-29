@@ -44,7 +44,8 @@ describe('DelayedRetryScheduler Atomic Claim & Zero Loss', () => {
       'event_id', 'evt_delayed_01',
       'tenant_id', rawPayload.tenant_id,
       'platform', 'shopify',
-      'data', '{}'
+      'data', '{}',
+      'defer_count', '0'
     );
   });
 
@@ -79,3 +80,4 @@ describe('DelayedRetryScheduler Atomic Claim & Zero Loss', () => {
     );
   });
 });
+

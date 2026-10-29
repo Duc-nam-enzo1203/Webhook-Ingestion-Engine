@@ -14,8 +14,8 @@ export interface OccUpsertResult {
 export const OCC_STATE_UPSERT_SQL = `
 INSERT INTO entity_states (
     tenant_id, platform, entity_type, entity_id,
-    current_state, state_weight, external_version, is_hydrated, merged_payload, updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+    current_state, state_weight, external_version, is_hydrated, was_previously_hydrated, merged_payload, updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, NOW())
 ON CONFLICT (tenant_id, platform, entity_type, entity_id)
 DO UPDATE SET
     current_state = CASE
@@ -26,6 +26,7 @@ DO UPDATE SET
     END,
     state_weight = GREATEST(entity_states.state_weight, EXCLUDED.state_weight),
     external_version = GREATEST(entity_states.external_version, EXCLUDED.external_version),
+    was_previously_hydrated = entity_states.is_hydrated,
     is_hydrated = entity_states.is_hydrated OR EXCLUDED.is_hydrated,
     merged_payload = CASE
         WHEN EXCLUDED.state_weight > entity_states.state_weight
@@ -41,7 +42,8 @@ RETURNING
     (xmax = 0) AS is_inserted,
     (EXCLUDED.state_weight < entity_states.state_weight OR 
      (EXCLUDED.state_weight = entity_states.state_weight AND EXCLUDED.external_version < entity_states.external_version)
-    ) AS is_stale_ignored;
+    ) AS is_stale_ignored,
+    (EXCLUDED.is_hydrated AND NOT entity_states.was_previously_hydrated) AS is_newly_hydrated;
 `;
 
 /**
@@ -128,8 +130,8 @@ export async function executeOccStateUpsert(
   const isStale = Boolean(row.is_stale_ignored);
   const isInserted = Boolean(row.is_inserted);
   const isHydrated = Boolean(row.is_hydrated);
-  // An event brought new hydration if it was hydrated and merged into an existing entity
-  const isNewlyHydrated = event.isHydrated && !isInserted;
+  // Crucial: isNewlyHydrated is true ONLY if this entity was unhydrated prior to this update!
+  const isNewlyHydrated = Boolean(row.is_newly_hydrated);
 
   return {
     currentState: row.current_state,

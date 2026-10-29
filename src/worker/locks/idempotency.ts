@@ -40,6 +40,15 @@ return 0
 
 export type IdempotencyLockStatus = 'ACQUIRED' | 'ALREADY_DONE' | 'IN_FLIGHT_BY_OTHER';
 
+/**
+ * Canonical Redis key generator for Idempotency Locks.
+ * Uses Redis Hash Tag `{tenantId}` to guarantee multi-key Lua commands
+ * hash to the exact same cluster hash slot.
+ */
+export function getIdempotencyRedisKey(tenantId: string, platform: string, eventId: string): string {
+  return `idemp:{${tenantId}}:${platform}:${eventId}`;
+}
+
 export async function acquireIdempotencyLock(
   redis: Redis,
   tenantId: string,
@@ -48,7 +57,7 @@ export async function acquireIdempotencyLock(
   workerId: string,
   leaseTtlMs = 30000
 ): Promise<IdempotencyLockStatus> {
-  const key = `idemp:{${tenantId}}:${platform}:${eventId}`;
+  const key = getIdempotencyRedisKey(tenantId, platform, eventId);
 
   try {
     const res = (await redis.eval(
@@ -74,7 +83,7 @@ export async function finalizeIdempotencyLock(
   action: 'COMMIT_DONE' | 'ABORT_RELEASE',
   doneTtlSeconds = 86400 // 24 hours
 ): Promise<boolean> {
-  const key = `idemp:{${tenantId}}:${platform}:${eventId}`;
+  const key = getIdempotencyRedisKey(tenantId, platform, eventId);
 
   try {
     const res = (await redis.eval(

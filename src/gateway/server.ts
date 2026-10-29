@@ -1,11 +1,12 @@
 import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import fastifyRawBody from 'fastify-raw-body';
+import crypto from 'node:crypto';
 import { env } from '../config/env.js';
 import { logger } from '../shared/observability/logger.js';
-import { 
-  metricsRegistry, 
-  gatewayRequestsTotal, 
-  gatewayLatencyMs 
+import {
+  metricsRegistry,
+  gatewayRequestsTotal,
+  gatewayLatencyMs
 } from '../shared/observability/metrics.js';
 import { getPlatformAdapter } from './adapters/index.js';
 import { RawWebhookRequest, VerifiedWebhookEvent } from './adapters/types.js';
@@ -15,6 +16,7 @@ import { getDbPool } from '../shared/db/postgres.js';
 import { shuffleShardingRouter } from './router/shuffle-sharding.js';
 import { checkTenantRateLimit } from './middlewares/rate-limiter.js';
 import { backpressureChecker } from './middlewares/backpressure.js';
+import { getIdempotencyRedisKey } from '../worker/locks/idempotency.js';
 
 export async function buildGatewayServer(): Promise<FastifyInstance> {
   const server = Fastify({
@@ -48,11 +50,19 @@ export async function buildGatewayServer(): Promise<FastifyInstance> {
     return reply.send(await metricsRegistry.metrics());
   });
 
-  // Admin Authentication PreHandler
+  // Admin Authentication PreHandler with Timing Attack Protection
   const adminAuthPreHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const adminKey = (req.headers['x-admin-key'] as string) || (req.headers.authorization?.replace(/^Bearer\s+/i, ''));
-    if (!adminKey || adminKey !== env.ADMIN_API_KEY) {
-      return reply.code(401).send({ error: 'Unauthorized: Invalid or missing admin authentication key' });
+    if (!adminKey) {
+      return reply.code(401).send({ error: 'Unauthorized: Missing admin authentication key' });
+    }
+    const expectedKeyBuffer = Buffer.from(env.ADMIN_API_KEY);
+    const actualKeyBuffer = Buffer.from(adminKey);
+    if (
+      expectedKeyBuffer.length !== actualKeyBuffer.length ||
+      !crypto.timingSafeEqual(expectedKeyBuffer, actualKeyBuffer)
+    ) {
+      return reply.code(401).send({ error: 'Unauthorized: Invalid admin authentication key' });
     }
   };
 
@@ -170,10 +180,10 @@ export async function buildGatewayServer(): Promise<FastifyInstance> {
           [tenantId, platform, eventId]
         );
 
-        // 4. CRITICAL FIX: Delete Redis Fast-Path Idempotency Lock!
-        // Previously, 'COMMIT_DONE' kept Redis lock as 'DONE' for 24h, causing immediate DUPLICATE drop upon replay!
+        // 4. CRITICAL FIX: Delete Redis Fast-Path Idempotency Lock using canonical key with hash tags!
+        // Previously, missing '{tenantId}' hash tags caused DEL to delete wrong key, leaving DONE lock active!
         const redis = getRedisClient();
-        const lockKey = `idemp:${tenantId}:${platform}:${eventId}`;
+        const lockKey = getIdempotencyRedisKey(tenantId, platform, eventId);
         await redis.del(lockKey);
 
         // 5. Select destination shard via Shuffle Sharding
@@ -230,8 +240,8 @@ export async function buildGatewayServer(): Promise<FastifyInstance> {
     }
 
     // Extract tenant_id from Header or Query parameter
-    const tenantId = 
-      (req.headers['x-tenant-id'] as string) || 
+    const tenantId =
+      (req.headers['x-tenant-id'] as string) ||
       req.query.tenant_id;
 
     if (!tenantId) {
@@ -277,7 +287,7 @@ export async function buildGatewayServer(): Promise<FastifyInstance> {
     if (!rateLimit.allowed) {
       gatewayRequestsTotal.inc({ platform, status: '429_rate_limited' });
       reply.header('Retry-After', String(rateLimit.retryAfterSec));
-      return reply.code(429).send({ 
+      return reply.code(429).send({
         error: 'Rate limit exceeded for tenant',
         retry_after_seconds: rateLimit.retryAfterSec,
       });
@@ -288,13 +298,13 @@ export async function buildGatewayServer(): Promise<FastifyInstance> {
 
     // 5. Active Backpressure Check (prevents OOM & blind MAXLEN data drops)
     const backpressure = await backpressureChecker.checkBackpressure(
-      redis, 
+      redis,
       shardSelection.selectedShard
     );
     if (backpressure.overloaded) {
       gatewayRequestsTotal.inc({ platform, status: '503_backpressure' });
       reply.header('Retry-After', String(backpressure.retryAfterSec));
-      return reply.code(503).send({ 
+      return reply.code(503).send({
         error: 'Ingestion engine experiencing backpressure',
         reason: backpressure.reason,
       });

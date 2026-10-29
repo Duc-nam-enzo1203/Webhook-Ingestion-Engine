@@ -64,6 +64,7 @@ services:
       REDIS_PORT: 6379
       STREAM_SHARD_COUNT: 16
       DOWNSTREAM_URL: http://mock-erp:4000/downstream
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-admin_secret_super_secure_key}
     ports:
       - "3000:3000"
     depends_on:
@@ -87,6 +88,8 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       STREAM_SHARD_COUNT: 16
+      DOWNSTREAM_URL: http://mock-erp:4000/downstream
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-admin_secret_super_secure_key}
     depends_on:
       postgres:
         condition: service_healthy

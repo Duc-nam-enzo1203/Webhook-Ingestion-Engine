@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS entity_states (
     state_weight INT NOT NULL,              -- CREATED=10, PAID=20, SHIPPED=30, COMPLETED=40, CANCELLED=99
     external_version BIGINT NOT NULL,       -- Sequence number hoặc Unix timestamp (ms) từ sàn
     is_hydrated BOOLEAN NOT NULL DEFAULT FALSE, -- TRUE khi đã nhận đủ dữ liệu gốc (như line_items)
+    was_previously_hydrated BOOLEAN NOT NULL DEFAULT FALSE, -- Lưu vết trạng thái trước update để nhận diện late hydration
     merged_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (tenant_id, platform, entity_type, entity_id)

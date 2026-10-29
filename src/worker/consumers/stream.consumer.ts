@@ -6,6 +6,7 @@ import { WebhookProcessor } from '../processor.js';
 import { streamBacklogRecords } from '../../shared/observability/metrics.js';
 import { safeStreamTrimmer } from '../trimmer/stream-trimmer.js';
 import { delayedRetryScheduler } from '../resilience/delayed-retry.js';
+import { reconciliationSweeper } from '../reconciliation/sweeper.js';
 
 export class StreamConsumerPool {
   private readonly groupName = 'webhook_workers';
@@ -108,6 +109,9 @@ export class StreamConsumerPool {
     // Start Delayed Retry Loop (runs every 1s)
     delayedRetryScheduler.start(redis, 1000);
 
+    // Start Reconciliation Sweeper for stuck PERSISTED events (runs every 30s)
+    reconciliationSweeper.start(redis, 30000);
+
     logger.info({ workerId: this.workerId }, '🚀 Stream Consumer Worker Pool started');
 
     const shardKeys: string[] = [];
@@ -171,9 +175,16 @@ export class StreamConsumerPool {
     }
     safeStreamTrimmer.stop();
     delayedRetryScheduler.stop();
+    reconciliationSweeper.stop();
   }
 
-  private parseStreamFields(fields: string[]): { event_id: string; tenant_id: string; platform: string; data: string } | null {
+  private parseStreamFields(fields: string[]): {
+    event_id: string;
+    tenant_id: string;
+    platform: string;
+    data: string;
+    defer_count?: number;
+  } | null {
     const obj: Record<string, string> = {};
     for (let i = 0; i < fields.length; i += 2) {
       obj[fields[i]] = fields[i + 1];
@@ -184,6 +195,7 @@ export class StreamConsumerPool {
         tenant_id: obj.tenant_id,
         platform: obj.platform || 'shopify',
         data: obj.data,
+        defer_count: obj.defer_count ? Number(obj.defer_count) : 0,
       };
     }
     return null;

@@ -165,8 +165,8 @@ describe('Integration: DLQ Admin & Safe Replay', () => {
     expect(body.event_id).toBe(eventId);
     expect(body.current_state).toBe('PAID'); // Verified that canonical state 'PAID' is used, not 'REPLAY'
 
-    // 1. Assert: Redis Fast-Path lock was deleted so worker will NOT drop it as ALREADY_DONE!
-    expect(mockRedis.del).toHaveBeenCalledWith(`idemp:${tenantId}:shopify:${eventId}`);
+    // 1. Assert: Redis Fast-Path lock was deleted with hash tag {tenantId} so worker will NOT drop it as ALREADY_DONE!
+    expect(mockRedis.del).toHaveBeenCalledWith(`idemp:{${tenantId}}:shopify:${eventId}`);
 
     // 2. Assert: Postgres event is QUEUED and idempotency key is PERSISTED
     expect(mockDb.webhookEvents.get(key)?.delivery_status).toBe('QUEUED');

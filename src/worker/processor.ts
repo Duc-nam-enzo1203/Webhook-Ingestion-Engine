@@ -1,5 +1,6 @@
 import { Redis } from 'ioredis';
 import pg from 'pg';
+import { env } from '../config/env.js';
 import { getDbPool } from '../shared/db/postgres.js';
 import { logger } from '../shared/observability/logger.js';
 import {
@@ -22,6 +23,22 @@ export interface ProcessEventResult {
   durationMs: number;
   reason?: string;
   error?: string;
+}
+
+/**
+ * Resolves the downstream URL based on execution environment.
+ * If running inside Docker (where REDIS_HOST != localhost/127.0.0.1),
+ * maps localhost:4000 to mock-erp:4000.
+ */
+export function resolveDownstreamUrl(dbUrl: string | null | undefined, envOverride?: string): string | null {
+  if (dbUrl === null) return null;
+  const url = dbUrl || envOverride;
+  if (!url) return null;
+  const isDocker = env.REDIS_HOST !== '127.0.0.1' && env.REDIS_HOST !== 'localhost';
+  if (isDocker) {
+    return url.replace(/localhost:4000|127\.0\.0\.1:4000/g, 'mock-erp:4000');
+  }
+  return url;
 }
 
 export class WebhookProcessor {
@@ -63,7 +80,7 @@ export class WebhookProcessor {
       const deferCount = (rawPayload.defer_count || 0) + 1;
       if (deferCount >= 10) {
         logger.error({ tenantId, eventId, deferCount }, 'Tenant circuit breaker OPEN max attempts reached, moving to DLQ');
-        await this.routeDirectlyToDlq(pool, tenantId, platform, eventId, 'CIRCUIT_OPEN_MAX_RETRIES');
+        await this.routeDirectlyToDlq(pool, event, 'CIRCUIT_OPEN_MAX_RETRIES', deferCount);
         dlqDepth.inc();
         return { status: 'DLQ', eventId, durationMs: Date.now() - startTime, error: 'CIRCUIT_OPEN_MAX_RETRIES' };
       }
@@ -87,12 +104,11 @@ export class WebhookProcessor {
       const deferCount = (rawPayload.defer_count || 0) + 1;
       if (deferCount >= 10) {
         logger.error({ tenantId, eventId, deferCount }, 'Tenant concurrency saturated max attempts reached, moving to DLQ');
-        await this.routeDirectlyToDlq(pool, tenantId, platform, eventId, 'SEMAPHORE_SATURATION_MAX_RETRIES');
+        await this.routeDirectlyToDlq(pool, event, 'SEMAPHORE_SATURATION_MAX_RETRIES', deferCount);
         dlqDepth.inc();
         return { status: 'DLQ', eventId, durationMs: Date.now() - startTime, error: 'SEMAPHORE_SATURATION_MAX_RETRIES' };
       }
 
-      // Concurrency limit reached for this tenant; defer briefly (1s) and ACK original from PEL
       logger.debug({ tenantId, eventId, deferCount }, 'Tenant semaphore full, deferring');
       await delayedRetryScheduler.schedule(redis, streamKey, { ...rawPayload, defer_count: deferCount }, 1000);
       return { status: 'DEFERRED', eventId, durationMs: Date.now() - startTime, reason: 'SEMAPHORE_FULL' };
@@ -118,7 +134,6 @@ export class WebhookProcessor {
       if (lockStatus === 'IN_FLIGHT_BY_OTHER') {
         idempotencyHitsTotal.inc({ tier: 'redis_inflight' });
         await releaseTenantSemaphore(redis, tenantId, ownerId);
-        // Defer 1s so other worker can finish, ACK original
         await delayedRetryScheduler.schedule(redis, streamKey, rawPayload, 1000);
         return { status: 'DEFERRED', eventId, durationMs: Date.now() - startTime, reason: 'IN_FLIGHT' };
       }
@@ -160,7 +175,7 @@ export class WebhookProcessor {
             return { status: 'DLQ', eventId, durationMs: Date.now() - startTime };
           }
 
-          // If PERSISTED or IN_PROGRESS from previous attempt or DLQ replay: Read canonical DB state!
+          // If PERSISTED or IN_PROGRESS: Read canonical DB state!
           const stateCheck = await client.query(
             `SELECT current_state, merged_payload FROM entity_states 
              WHERE tenant_id = $1 AND platform = $2 AND entity_type = $3 AND entity_id = $4`,
@@ -212,17 +227,13 @@ export class WebhookProcessor {
           resolvedPayload = occResult.mergedPayload;
 
           // Late Hydration Resolution:
-          // If a late ORDER_CREATED arrives for an already CANCELLED order, occResult.isNewlyHydrated is true.
-          // We MUST deliver the enriched customer/line-items payload downstream while keeping state CANCELLED!
+          // isNewlyHydrated is true ONLY if this entity was unhydrated prior to this update.
           if (occResult.isNewlyHydrated) {
             outOfOrderResolvedTotal.inc({ resolution: 'hydrated_late_create' });
             deliveryNeeded = true;
           } else if (occResult.isStaleIgnored) {
             outOfOrderResolvedTotal.inc({ resolution: 'ignored_stale_update' });
             deliveryNeeded = false; // Pure duplicate/stale event with no new info
-          } else if (occResult.isHydrated && !occResult.isInserted) {
-            outOfOrderResolvedTotal.inc({ resolution: 'hydrated_late_create' });
-            deliveryNeeded = true;
           } else {
             outOfOrderResolvedTotal.inc({ resolution: 'normal_progression' });
             deliveryNeeded = true;
@@ -262,7 +273,7 @@ export class WebhookProcessor {
       }
 
       // 6. Dispatch to Downstream ERP with merged state & timeout
-      const targetUrl = tenant.downstreamUrl;
+      const targetUrl = resolveDownstreamUrl(tenant.downstreamUrl, env.DOWNSTREAM_URL);
       let dispatchError: { isClientError: boolean; status?: number; message: string } | null = null;
 
       if (targetUrl) {
@@ -366,7 +377,6 @@ export class WebhookProcessor {
         updateClient.release();
       }
     } catch (err: any) {
-      // NOTE: Do NOT record circuit breaker failure for local DB / locking errors
       await finalizeIdempotencyLock(redis, tenantId, platform, eventId, this.workerId, 'ABORT_RELEASE');
       await releaseTenantSemaphore(redis, tenantId, ownerId);
 
@@ -374,36 +384,51 @@ export class WebhookProcessor {
       workerProcessingDurationMs.observe({ platform, outcome: 'error' }, durationMs);
       logger.error({ err, tenantId, eventId }, 'Worker processing error occurred');
 
+      const deferCount = (rawPayload.defer_count || 0) + 1;
+      if (deferCount >= 5) {
+        logger.error({ err, tenantId, eventId, deferCount }, 'Fatal system/DB error exceeded max attempts, routing to DLQ');
+        await this.routeDirectlyToDlq(pool, event, `SYSTEM_ERROR: ${err.message || String(err)}`, deferCount);
+        dlqDepth.inc();
+        return { status: 'DLQ', eventId, durationMs, error: err.message || String(err) };
+      }
+
+      await delayedRetryScheduler.schedule(redis, streamKey, { ...rawPayload, defer_count: deferCount }, 3000);
       return {
-        status: 'FAILED_RETRY',
+        status: 'DEFERRED',
         eventId,
         durationMs,
+        reason: 'SYSTEM_ERROR',
         error: err.message || String(err),
       };
     }
   }
 
+  /**
+   * Directly routes an event to DLQ with an atomic upsert into PostgreSQL.
+   * Guarantees zero data loss even if the event was deferred before the main DB transaction.
+   */
   private async routeDirectlyToDlq(
     pool: pg.Pool,
-    tenantId: string,
-    platform: string,
-    eventId: string,
-    errorMessage: string
+    event: VerifiedWebhookEvent,
+    errorMessage: string,
+    retryCount = 0
   ): Promise<void> {
+    const { tenantId, platform, eventId, entityType, entityId, payload } = event;
     try {
       const client = await pool.connect();
       try {
         await client.query(
-          `UPDATE webhook_events 
-           SET delivery_status = 'DLQ', last_error = $1
-           WHERE tenant_id = $2 AND platform = $3 AND event_id = $4`,
-          [errorMessage, tenantId, platform, eventId]
+          `INSERT INTO idempotency_keys (tenant_id, platform, event_id, status, locked_by, updated_at)
+           VALUES ($1, $2, $3, 'DLQ', $4, NOW())
+           ON CONFLICT (tenant_id, platform, event_id)
+           DO UPDATE SET status = 'DLQ', updated_at = NOW()`,
+          [tenantId, platform, eventId, this.workerId]
         );
+
         await client.query(
-          `UPDATE idempotency_keys 
-           SET status = 'DLQ', updated_at = NOW() 
-           WHERE tenant_id = $1 AND platform = $2 AND event_id = $3`,
-          [tenantId, platform, eventId]
+          `INSERT INTO webhook_events (tenant_id, platform, event_id, entity_type, entity_id, delivery_status, retry_count, raw_payload, last_error, created_at)
+           VALUES ($1, $2, $3, $4, $5, 'DLQ', $6, $7, $8, NOW())`,
+          [tenantId, platform, eventId, entityType, entityId, retryCount, JSON.stringify(payload), errorMessage]
         );
       } finally {
         client.release();

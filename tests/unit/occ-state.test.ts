@@ -106,6 +106,21 @@ describe('Out-of-Order OCC State Machine & Bidirectional JSONB Hydration', () =>
     expect(finalResolution.currentState).toBe('CANCELLED');
     expect(finalResolution.isStateAdvanced).toBe(false);
     expect(finalResolution.isStaleIgnored).toBe(true);
+    expect(finalResolution.isNewlyHydrated).toBe(true); // First time hydration occurred!
+
+    // Subsequent arrival of the same hydrated event on already-hydrated entity:
+    const duplicateLate = simulateOccMerge(
+      {
+        currentState: finalResolution.currentState,
+        stateWeight: 99,
+        externalVersion: 1761720300000,
+        isHydrated: finalResolution.isHydrated,
+        mergedPayload: finalResolution.mergedPayload,
+      },
+      incomingCreated
+    );
+    // Must NOT be newly hydrated again
+    expect(duplicateLate.isNewlyHydrated).toBe(false);
 
     // Assert: Order is now successfully HYDRATED with details
     expect(finalResolution.isHydrated).toBe(true);

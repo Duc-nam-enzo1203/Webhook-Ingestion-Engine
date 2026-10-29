@@ -103,20 +103,21 @@ export class DelayedRetryScheduler {
         const { streamKey, rawPayload } = item;
 
         try {
-          // Re-append to the stream shard
+          // Re-append to the stream shard with defer_count preserved
           await redis.xadd(
             streamKey,
             '*',
             'event_id', rawPayload.event_id,
             'tenant_id', rawPayload.tenant_id,
             'platform', rawPayload.platform,
-            'data', rawPayload.data
+            'data', rawPayload.data,
+            'defer_count', String(rawPayload.defer_count || 0)
           );
           replayedCount++;
         } catch (xaddErr) {
           logger.error({ err: xaddErr, eventId: rawPayload.event_id, streamKey }, 'Failed to XADD replayed item, restoring to ZSET');
           // Re-schedule with 2-second backoff so retry is not lost
-          await redis.zadd(this.retryKey, Date.now() + 2000, itemStr).catch(() => {});
+          await redis.zadd(this.retryKey, Date.now() + 2000, itemStr).catch(() => { });
         }
       }
     } catch (err) {
