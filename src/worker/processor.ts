@@ -76,10 +76,30 @@ export class WebhookProcessor {
     // 1. Fetch Tenant Configuration (Distinguish non-existent tenant vs database outage)
     let tenant: TenantConfig | null;
     try {
-      tenant = await tenantCache.getTenant(tenantId);
+      tenant = await tenantCache.getTenant(tenantId, pool);
     } catch (err: any) {
-      logger.error({ err, tenantId, eventId }, 'Failed to resolve tenant due to DB error, will retry without losing message');
-      throw err; // Caught by outer catch to preserve message in PEL and retry with backoff
+      logger.error({ err, tenantId, eventId }, 'Failed to resolve tenant due to DB error, scheduling retry without losing message');
+      const deferCount = (rawPayload.defer_count || 0) + 1;
+      if (deferCount >= 5) {
+        logger.error({ err, tenantId, eventId, deferCount }, 'Fatal DB error resolving tenant exceeded max attempts, attempting DLQ routing');
+        const routed = await this.routeDirectlyToDlq(pool, event, `SYSTEM_ERROR: ${err.message || String(err)}`, deferCount);
+        if (routed) {
+          dlqDepth.inc();
+          return { status: 'DLQ', eventId, durationMs: Date.now() - startTime, error: err.message || String(err) };
+        }
+        logger.error({ tenantId, eventId }, 'Postgres outage prevented DLQ persistence, retaining message in stream PEL');
+        return { status: 'FAILED_RETRY', eventId, durationMs: Date.now() - startTime, error: 'DB_DOWN_CANNOT_DLQ' };
+      }
+
+      const retryDelayMs = Math.min(30000, 3000 * Math.pow(2, deferCount - 1));
+      await delayedRetryScheduler.schedule(redis, streamKey, { ...rawPayload, defer_count: deferCount }, retryDelayMs);
+      return {
+        status: 'DEFERRED',
+        eventId,
+        durationMs: Date.now() - startTime,
+        reason: 'SYSTEM_ERROR',
+        error: err.message || String(err),
+      };
     }
 
     if (!tenant) {

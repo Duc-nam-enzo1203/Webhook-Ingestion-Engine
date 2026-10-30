@@ -1,3 +1,4 @@
+import pg from 'pg';
 import { LRUCache } from 'lru-cache';
 import { getRedisClient, getRedisSubscriber } from '../db/redis.js';
 import { getDbPool } from '../db/postgres.js';
@@ -35,7 +36,7 @@ export class MultiTierTenantCache {
     try {
       const subscriber = getRedisSubscriber();
       await subscriber.subscribe(this.pubSubChannel);
-      
+
       subscriber.on('message', (channel, tenantId) => {
         if (channel === this.pubSubChannel && tenantId) {
           this.l1Cache.delete(tenantId);
@@ -53,7 +54,7 @@ export class MultiTierTenantCache {
    * Retrieves tenant configuration through Multi-Tier caching:
    * L1 (Process RAM) -> L2 (Redis Hash) -> DB (PostgreSQL)
    */
-  async getTenant(tenantId: string): Promise<TenantConfig | null> {
+  async getTenant(tenantId: string, poolOverride?: pg.Pool): Promise<TenantConfig | null> {
     // 1. Check L1 Cache
     const cachedL1 = this.l1Cache.get(tenantId);
     if (cachedL1) {
@@ -77,7 +78,7 @@ export class MultiTierTenantCache {
 
     // 3. Fallback to PostgreSQL
     try {
-      const pool = getDbPool();
+      const pool = poolOverride || getDbPool();
       const res = await pool.query(
         `SELECT id, name, platform, webhook_secret, rate_limit_rps, max_concurrency, downstream_url, is_active 
          FROM tenants 
@@ -126,7 +127,7 @@ export class MultiTierTenantCache {
    */
   async invalidateTenant(tenantId: string): Promise<void> {
     this.l1Cache.delete(tenantId);
-    
+
     try {
       const redis = getRedisClient();
       await redis.del(`tenant:config:${tenantId}`);

@@ -27,7 +27,7 @@ describe('Integration: Real Infrastructure Tests (PostgreSQL & Redis)', () => {
         maxRetriesPerRequest: 1,
         lazyConnect: true,
       });
-      redis.on('error', () => {});
+      redis.on('error', () => { });
       await redis.connect();
       await redis.ping();
 
@@ -46,13 +46,13 @@ describe('Integration: Real Infrastructure Tests (PostgreSQL & Redis)', () => {
 
   afterAll(async () => {
     if (redis) {
-      await redis.quit().catch(() => {});
+      await redis.quit().catch(() => { });
     }
     if (pool) {
-      await pool.end().catch(() => {});
+      await pool.end().catch(() => { });
     }
     if (app) {
-      await app.close().catch(() => {});
+      await app.close().catch(() => { });
     }
   });
 
@@ -237,6 +237,7 @@ describe('Integration: Real Infrastructure Tests (PostgreSQL & Redis)', () => {
       connectionString: 'postgresql://postgres:postgres@127.0.0.1:54399/webhook_engine',
       connectionTimeoutMillis: 500,
     });
+    deadPool.on('error', () => {});
 
     const processor = new WebhookProcessor('test_failover_worker', deadPool);
     const tenantId = 'a0000000-0000-0000-0000-000000000001';
@@ -292,7 +293,7 @@ describe('Integration: Real Infrastructure Tests (PostgreSQL & Redis)', () => {
       expect(result.status).toBe('FAILED_RETRY');
       expect(result.error).toBe('DB_DOWN_CANNOT_DLQ');
     } finally {
-      await deadPool.end().catch(() => {});
+      await deadPool.end().catch(() => { });
     }
   });
 
@@ -306,9 +307,10 @@ describe('Integration: Real Infrastructure Tests (PostgreSQL & Redis)', () => {
       connectionString: 'postgresql://postgres:postgres@127.0.0.1:54399/webhook_engine',
       connectionTimeoutMillis: 500,
     });
+    deadPool.on('error', () => {});
 
     const processor = new WebhookProcessor('test_cold_start_worker', deadPool);
-    const tenantId = `tenant_cold_${Date.now()}`;
+    const tenantId = 'e0000000-0000-0000-0000-000000000099';
     const platform = 'shopify';
     const eventId = `evt_cold_${Date.now()}`;
 
@@ -351,7 +353,7 @@ describe('Integration: Real Infrastructure Tests (PostgreSQL & Redis)', () => {
       expect(result.status).toBe('FAILED_RETRY');
       expect(result.error).toBe('DB_DOWN_CANNOT_DLQ');
     } finally {
-      await deadPool.end().catch(() => {});
+      await deadPool.end().catch(() => { });
     }
   });
 });
