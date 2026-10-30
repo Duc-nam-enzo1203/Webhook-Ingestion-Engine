@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildGatewayServer } from '../../src/gateway/server.js';
 import { FastifyInstance } from 'fastify';
+import { env } from '../../src/config/env.js';
 
 const mockDb = {
   webhookEvents: new Map<string, any>(),
@@ -70,7 +71,7 @@ vi.mock('../../src/shared/db/postgres.js', () => ({
 
 describe('Integration: DLQ Admin & Safe Replay', () => {
   let app: FastifyInstance;
-  const adminKey = 'admin_secret_super_secure_key';
+  const adminKey = env.ADMIN_API_KEY;
   const tenantId = 'a0000000-0000-0000-0000-000000000001';
 
   beforeEach(async () => {

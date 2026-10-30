@@ -9,9 +9,9 @@ scrape_configs:
         labels:
           service: 'ingestion-gateway'
 
-  - job_name: 'webhook-engine-node'
+  - job_name: 'webhook-worker'
     static_configs:
-      - targets: ['gateway:3000']
+      - targets: ['worker:3002']
         labels:
-          role: 'runtime-metrics'
+          service: 'webhook-worker'
 

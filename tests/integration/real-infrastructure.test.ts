@@ -143,4 +143,151 @@ describe('Integration: Real Infrastructure Tests (PostgreSQL & Redis)', () => {
     expect(insertedCount).toBe(1);
     expect(conflictedCount).toBe(19);
   });
+
+  it('verifies real PostgreSQL OCC State Upsert without EXCLUDED reference error and validates out-of-order hydration', async (ctx) => {
+    if (!isAvailable || !pool) {
+      ctx.skip();
+      return;
+    }
+
+    const { executeOccStateUpsert } = await import('../../src/worker/state-machine/occ-state.js');
+    const tenantId = 'a0000000-0000-0000-0000-000000000001';
+    const platform = 'shopify';
+    const entityId = `ord_occ_test_${Date.now()}`;
+
+    // 1. First event: CANCELLED arrives first (Weight 90, unhydrated partial payload)
+    const cancelledEvent = {
+      tenantId,
+      platform,
+      eventId: `evt_cancel_${Date.now()}`,
+      entityType: 'ORDER',
+      entityId,
+      eventType: 'orders/cancelled',
+      currentState: 'CANCELLED',
+      stateWeight: 90,
+      externalVersion: 1761720300000,
+      isHydrated: false,
+      payload: {
+        order_id: entityId,
+        status: 'cancelled',
+        cancel_reason: 'fraud_flag',
+      },
+      rawBody: '{}',
+      receivedAt: new Date().toISOString(),
+    };
+
+    const res1 = await executeOccStateUpsert(pool, cancelledEvent);
+    expect(res1.currentState).toBe('CANCELLED');
+    expect(res1.isHydrated).toBe(false);
+    expect(res1.isInserted).toBe(true);
+    expect(res1.isStaleIgnored).toBe(false);
+    // Crucial: Initial insert must NOT be marked as late hydration!
+    expect(res1.isNewlyHydrated).toBe(false);
+    expect(res1.mergedPayload.cancel_reason).toBe('fraud_flag');
+
+    // 2. Second event: CREATED arrives later (Weight 10, hydrated payload with line_items)
+    const createdEvent = {
+      tenantId,
+      platform,
+      eventId: `evt_create_${Date.now()}`,
+      entityType: 'ORDER',
+      entityId,
+      eventType: 'orders/create',
+      currentState: 'CREATED',
+      stateWeight: 10,
+      externalVersion: 1761720000000,
+      isHydrated: true,
+      payload: {
+        order_id: entityId,
+        status: 'open',
+        line_items: [{ sku: 'PROD-1', quantity: 2 }],
+        customer: 'John Doe',
+      },
+      rawBody: '{}',
+      receivedAt: new Date().toISOString(),
+    };
+
+    const res2 = await executeOccStateUpsert(pool, createdEvent);
+    // State remains CANCELLED (does not regress to CREATED)
+    expect(res2.currentState).toBe('CANCELLED');
+    expect(res2.isHydrated).toBe(true);
+    expect(res2.isInserted).toBe(false);
+    expect(res2.isStaleIgnored).toBe(true);
+    // Crucial: Late hydration was detected!
+    expect(res2.isNewlyHydrated).toBe(true);
+    // Both payloads bidirectionally merged:
+    expect(res2.mergedPayload.cancel_reason).toBe('fraud_flag');
+    expect(res2.mergedPayload.customer).toBe('John Doe');
+    expect(res2.mergedPayload.line_items).toHaveLength(1);
+    expect(res2.mergedPayload.status).toBe('cancelled');
+
+    // 3. Duplicate CREATED arrives:
+    const res3 = await executeOccStateUpsert(pool, createdEvent);
+    expect(res3.isNewlyHydrated).toBe(false);
+  });
+
+  it('verifies processor preserves message in PEL and returns FAILED_RETRY when DB is offline during DLQ routing', async (ctx) => {
+    if (!isAvailable || !redis) {
+      ctx.skip();
+      return;
+    }
+
+    // Mock pool pointing to a dead port to simulate PostgreSQL outage
+    const deadPool = new pg.Pool({
+      connectionString: 'postgresql://postgres:postgres@127.0.0.1:54399/webhook_engine',
+      connectionTimeoutMillis: 500,
+    });
+
+    const processor = new WebhookProcessor('test_failover_worker');
+    const tenantId = 'a0000000-0000-0000-0000-000000000001';
+    const platform = 'shopify';
+    const eventId = `evt_db_dead_${Date.now()}`;
+
+    // Replace the processor's internal pool temporarily or invoke with dead pool
+    const origGetDbPool = (await import('../../src/shared/db/postgres.js')).getDbPool;
+    const { getDbPool } = await import('../../src/shared/db/postgres.js');
+
+    // Call processEvent with max defer_count (5) to trigger DLQ routing
+    const rawPayload = {
+      event_id: eventId,
+      tenant_id: tenantId,
+      platform,
+      defer_count: 5,
+      data: JSON.stringify({
+        tenantId,
+        platform,
+        eventId,
+        entityType: 'ORDER',
+        entityId: 'ORD_DEAD_DB',
+        eventType: 'orders/create',
+        currentState: 'CREATED',
+        stateWeight: 10,
+        externalVersion: Date.now(),
+        isHydrated: true,
+        payload: { order_id: 'ORD_DEAD_DB' },
+        rawBody: '{}',
+        receivedAt: new Date().toISOString(),
+      }),
+    };
+
+    // Override getDbPool to simulate DB down
+    const pgModule = await import('../../src/shared/db/postgres.js');
+    (pgModule as any).getDbPool = () => deadPool;
+
+    try {
+      const result = await processor.processEvent(
+        redis,
+        'webhooks:stream:00',
+        '1000000000000-0',
+        rawPayload
+      );
+
+      // CRITICAL: Must return FAILED_RETRY (not DLQ) so stream.consumer does NOT XACK the message!
+      expect(result.status).toBe('FAILED_RETRY');
+      expect(result.error).toBe('DB_DOWN_CANNOT_DLQ');
+    } finally {
+      (pgModule as any).getDbPool = origGetDbPool;
+      await deadPool.end().catch(() => {});
+    }
+  });
 });

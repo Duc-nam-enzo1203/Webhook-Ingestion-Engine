@@ -37,6 +37,7 @@ export class ReconciliationSweeper {
     try {
       const client = await pool.connect();
       try {
+        await client.query('BEGIN');
         const query = `
           SELECT k.tenant_id, k.platform, k.event_id, 
                  e.entity_type, e.entity_id, e.raw_payload, e.retry_count
@@ -45,13 +46,17 @@ export class ReconciliationSweeper {
             ON k.tenant_id = e.tenant_id AND k.platform = e.platform AND k.event_id = e.event_id
           WHERE k.status IN ('PERSISTED', 'IN_PROGRESS')
             AND k.updated_at < NOW() - INTERVAL '2 minutes'
-            AND e.delivery_status NOT IN ('DELIVERED', 'DLQ')
+            AND e.delivery_status NOT IN ('DELIVERED', 'DLQ', 'RETRYING')
           ORDER BY k.updated_at ASC
           LIMIT $1
+          FOR UPDATE OF k SKIP LOCKED
         `;
 
         const res = await client.query(query, [limit]);
-        if (res.rows.length === 0) return 0;
+        if (res.rows.length === 0) {
+          await client.query('COMMIT');
+          return 0;
+        }
 
         logger.warn({ count: res.rows.length }, '🔍 Reconciliation Sweeper detected stuck events, re-enqueuing');
 
@@ -94,6 +99,13 @@ export class ReconciliationSweeper {
 
           replayedCount++;
         }
+
+        await client.query('COMMIT');
+      } catch (innerErr) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {}
+        throw innerErr;
       } finally {
         client.release();
       }
@@ -106,3 +118,4 @@ export class ReconciliationSweeper {
 }
 
 export const reconciliationSweeper = new ReconciliationSweeper();
+

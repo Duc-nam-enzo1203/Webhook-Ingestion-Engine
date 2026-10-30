@@ -31,8 +31,9 @@ const mockDbClient = {
 
     // Update idempotency_keys
     if (queryText.includes('UPDATE idempotency_keys')) {
-      let status = 'COMPLETED';
       let key = `${params[0]}:${params[1]}:${params[2]}`;
+      const existing = mockDb.idempotencyKeys.get(key) || { locked_by: 'worker' };
+      let status = existing.status || 'COMPLETED';
       if (queryText.includes("SET status = 'DLQ'")) {
         status = 'DLQ';
       } else if (queryText.includes("SET status = 'COMPLETED'")) {
@@ -41,7 +42,6 @@ const mockDbClient = {
         status = params[0];
         key = `${params[1]}:${params[2]}:${params[3]}`;
       }
-      const existing = mockDb.idempotencyKeys.get(key) || { locked_by: 'worker' };
       mockDb.idempotencyKeys.set(key, { ...existing, status });
       return { rowCount: 1 };
     }

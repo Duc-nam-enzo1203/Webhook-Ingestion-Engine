@@ -30,8 +30,11 @@ const envSchema = z.object({
   CIRCUIT_BREAKER_ERROR_THRESHOLD: z.coerce.number().default(50), // 50%
   CIRCUIT_BREAKER_RESET_TIMEOUT_MS: z.coerce.number().default(30000),
 
-  // Admin API Authentication
-  ADMIN_API_KEY: z.string().default('admin_secret_super_secure_key'),
+  // Worker Metrics Server Port
+  WORKER_METRICS_PORT: z.coerce.number().default(3002),
+
+  // Admin API Authentication (Mandatory, minimum 16 characters for security)
+  ADMIN_API_KEY: z.string().min(16),
 });
 
 export type Env = z.infer<typeof envSchema>;

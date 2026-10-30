@@ -40,10 +40,10 @@ RETURNING
     is_hydrated, 
     merged_payload,
     (xmax = 0) AS is_inserted,
-    (EXCLUDED.state_weight < entity_states.state_weight OR 
-     (EXCLUDED.state_weight = entity_states.state_weight AND EXCLUDED.external_version < entity_states.external_version)
+    ($6::int < entity_states.state_weight OR 
+     ($6::int = entity_states.state_weight AND $7::bigint < entity_states.external_version)
     ) AS is_stale_ignored,
-    (EXCLUDED.is_hydrated AND NOT entity_states.was_previously_hydrated) AS is_newly_hydrated;
+    ($8::boolean AND NOT entity_states.was_previously_hydrated AND NOT (xmax = 0)) AS is_newly_hydrated;
 `;
 
 /**

@@ -34,6 +34,9 @@ export function resolveDownstreamUrl(dbUrl: string | null | undefined, envOverri
   if (dbUrl === null) return null;
   const url = dbUrl || envOverride;
   if (!url) return null;
+  if (envOverride && (envOverride.includes('mock-erp') || !envOverride.includes('localhost'))) {
+    return url.replace(/localhost:4000|127\.0\.0\.1:4000/g, 'mock-erp:4000');
+  }
   const isDocker = env.REDIS_HOST !== '127.0.0.1' && env.REDIS_HOST !== 'localhost';
   if (isDocker) {
     return url.replace(/localhost:4000|127\.0\.0\.1:4000/g, 'mock-erp:4000');
@@ -80,9 +83,12 @@ export class WebhookProcessor {
       const deferCount = (rawPayload.defer_count || 0) + 1;
       if (deferCount >= 10) {
         logger.error({ tenantId, eventId, deferCount }, 'Tenant circuit breaker OPEN max attempts reached, moving to DLQ');
-        await this.routeDirectlyToDlq(pool, event, 'CIRCUIT_OPEN_MAX_RETRIES', deferCount);
-        dlqDepth.inc();
-        return { status: 'DLQ', eventId, durationMs: Date.now() - startTime, error: 'CIRCUIT_OPEN_MAX_RETRIES' };
+        const routed = await this.routeDirectlyToDlq(pool, event, 'CIRCUIT_OPEN_MAX_RETRIES', deferCount);
+        if (routed) {
+          dlqDepth.inc();
+          return { status: 'DLQ', eventId, durationMs: Date.now() - startTime, error: 'CIRCUIT_OPEN_MAX_RETRIES' };
+        }
+        return { status: 'FAILED_RETRY', eventId, durationMs: Date.now() - startTime, error: 'DB_DOWN_CANNOT_DLQ' };
       }
 
       logger.warn({ tenantId, eventId, deferCount }, 'Tenant circuit breaker OPEN, deferring via delayed retry');
@@ -104,9 +110,12 @@ export class WebhookProcessor {
       const deferCount = (rawPayload.defer_count || 0) + 1;
       if (deferCount >= 10) {
         logger.error({ tenantId, eventId, deferCount }, 'Tenant concurrency saturated max attempts reached, moving to DLQ');
-        await this.routeDirectlyToDlq(pool, event, 'SEMAPHORE_SATURATION_MAX_RETRIES', deferCount);
-        dlqDepth.inc();
-        return { status: 'DLQ', eventId, durationMs: Date.now() - startTime, error: 'SEMAPHORE_SATURATION_MAX_RETRIES' };
+        const routed = await this.routeDirectlyToDlq(pool, event, 'SEMAPHORE_SATURATION_MAX_RETRIES', deferCount);
+        if (routed) {
+          dlqDepth.inc();
+          return { status: 'DLQ', eventId, durationMs: Date.now() - startTime, error: 'SEMAPHORE_SATURATION_MAX_RETRIES' };
+        }
+        return { status: 'FAILED_RETRY', eventId, durationMs: Date.now() - startTime, error: 'DB_DOWN_CANNOT_DLQ' };
       }
 
       logger.debug({ tenantId, eventId, deferCount }, 'Tenant semaphore full, deferring');
@@ -358,6 +367,13 @@ export class WebhookProcessor {
           [newRetryCount, dispatchError.message, tenantId, platform, eventId]
         );
 
+        await updateClient.query(
+          `UPDATE idempotency_keys 
+           SET updated_at = NOW() 
+           WHERE tenant_id = $1 AND platform = $2 AND event_id = $3`,
+          [tenantId, platform, eventId]
+        );
+
         // Schedule delayed retry in Redis ZSET
         await delayedRetryScheduler.schedule(redis, streamKey, rawPayload, delayMs);
 
@@ -386,13 +402,21 @@ export class WebhookProcessor {
 
       const deferCount = (rawPayload.defer_count || 0) + 1;
       if (deferCount >= 5) {
-        logger.error({ err, tenantId, eventId, deferCount }, 'Fatal system/DB error exceeded max attempts, routing to DLQ');
-        await this.routeDirectlyToDlq(pool, event, `SYSTEM_ERROR: ${err.message || String(err)}`, deferCount);
-        dlqDepth.inc();
-        return { status: 'DLQ', eventId, durationMs, error: err.message || String(err) };
+        logger.error({ err, tenantId, eventId, deferCount }, 'Fatal system/DB error exceeded max attempts, attempting DLQ routing');
+        const routed = await this.routeDirectlyToDlq(pool, event, `SYSTEM_ERROR: ${err.message || String(err)}`, deferCount);
+        if (routed) {
+          dlqDepth.inc();
+          return { status: 'DLQ', eventId, durationMs, error: err.message || String(err) };
+        }
+        // If Postgres is down, recording to DLQ failed. DO NOT ACK!
+        // Return FAILED_RETRY so stream.consumer does NOT ack and message is retained in PEL.
+        logger.error({ tenantId, eventId }, 'Postgres outage prevented DLQ persistence, retaining message in stream PEL');
+        return { status: 'FAILED_RETRY', eventId, durationMs, error: 'DB_DOWN_CANNOT_DLQ' };
       }
 
-      await delayedRetryScheduler.schedule(redis, streamKey, { ...rawPayload, defer_count: deferCount }, 3000);
+      // For DB / infrastructure outages, backoff exponentially
+      const retryDelayMs = Math.min(30000, 3000 * Math.pow(2, deferCount - 1));
+      await delayedRetryScheduler.schedule(redis, streamKey, { ...rawPayload, defer_count: deferCount }, retryDelayMs);
       return {
         status: 'DEFERRED',
         eventId,
@@ -406,13 +430,14 @@ export class WebhookProcessor {
   /**
    * Directly routes an event to DLQ with an atomic upsert into PostgreSQL.
    * Guarantees zero data loss even if the event was deferred before the main DB transaction.
+   * Returns true if successfully committed to PostgreSQL, false otherwise.
    */
   private async routeDirectlyToDlq(
     pool: pg.Pool,
     event: VerifiedWebhookEvent,
     errorMessage: string,
     retryCount = 0
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { tenantId, platform, eventId, entityType, entityId, payload } = event;
     try {
       const client = await pool.connect();
@@ -430,11 +455,13 @@ export class WebhookProcessor {
            VALUES ($1, $2, $3, $4, $5, 'DLQ', $6, $7, $8, NOW())`,
           [tenantId, platform, eventId, entityType, entityId, retryCount, JSON.stringify(payload), errorMessage]
         );
+        return true;
       } finally {
         client.release();
       }
     } catch (err) {
       logger.error({ err, tenantId, eventId }, 'Failed to record direct DLQ routing');
+      return false;
     }
   }
 

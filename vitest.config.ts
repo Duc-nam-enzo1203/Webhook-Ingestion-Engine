@@ -5,6 +5,9 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['tests/**/*.test.ts'],
+    env: {
+      ADMIN_API_KEY: 'test_admin_super_secret_key_1234',
+    },
   },
 });
 
