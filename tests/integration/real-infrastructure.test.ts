@@ -232,22 +232,31 @@ describe('Integration: Real Infrastructure Tests (PostgreSQL & Redis)', () => {
       return;
     }
 
-    // Mock pool pointing to a dead port to simulate PostgreSQL outage
+    // Dead pool pointing to an offline port to simulate PostgreSQL outage
     const deadPool = new pg.Pool({
       connectionString: 'postgresql://postgres:postgres@127.0.0.1:54399/webhook_engine',
       connectionTimeoutMillis: 500,
     });
 
-    const processor = new WebhookProcessor('test_failover_worker');
+    const processor = new WebhookProcessor('test_failover_worker', deadPool);
     const tenantId = 'a0000000-0000-0000-0000-000000000001';
     const platform = 'shopify';
     const eventId = `evt_db_dead_${Date.now()}`;
 
-    // Replace the processor's internal pool temporarily or invoke with dead pool
-    const origGetDbPool = (await import('../../src/shared/db/postgres.js')).getDbPool;
-    const { getDbPool } = await import('../../src/shared/db/postgres.js');
+    // Prime tenant in L1 cache so tenant resolution passes from cache
+    const { tenantCache } = await import('../../src/shared/cache/tenant-cache.js');
+    tenantCache.setTenantInL1({
+      id: tenantId,
+      name: 'Test Tenant',
+      platform: 'shopify',
+      webhookSecret: 'test_secret',
+      rateLimitRps: 1000,
+      maxConcurrency: 10,
+      downstreamUrl: 'http://localhost:4000/downstream',
+      isActive: true,
+    });
 
-    // Call processEvent with max defer_count (5) to trigger DLQ routing
+    // Call processEvent with max defer_count (5) to trigger direct DLQ routing
     const rawPayload = {
       event_id: eventId,
       tenant_id: tenantId,
@@ -270,23 +279,78 @@ describe('Integration: Real Infrastructure Tests (PostgreSQL & Redis)', () => {
       }),
     };
 
-    // Override getDbPool to simulate DB down
-    const pgModule = await import('../../src/shared/db/postgres.js');
-    (pgModule as any).getDbPool = () => deadPool;
-
     try {
       const result = await processor.processEvent(
         redis,
         'webhooks:stream:00',
         '1000000000000-0',
-        rawPayload
+        rawPayload,
+        deadPool
       );
 
       // CRITICAL: Must return FAILED_RETRY (not DLQ) so stream.consumer does NOT XACK the message!
       expect(result.status).toBe('FAILED_RETRY');
       expect(result.error).toBe('DB_DOWN_CANNOT_DLQ');
     } finally {
-      (pgModule as any).getDbPool = origGetDbPool;
+      await deadPool.end().catch(() => {});
+    }
+  });
+
+  it('verifies getTenant throws on DB failure and processor does not ACK when worker cold starts during DB outage', async (ctx) => {
+    if (!isAvailable || !redis) {
+      ctx.skip();
+      return;
+    }
+
+    const deadPool = new pg.Pool({
+      connectionString: 'postgresql://postgres:postgres@127.0.0.1:54399/webhook_engine',
+      connectionTimeoutMillis: 500,
+    });
+
+    const processor = new WebhookProcessor('test_cold_start_worker', deadPool);
+    const tenantId = `tenant_cold_${Date.now()}`;
+    const platform = 'shopify';
+    const eventId = `evt_cold_${Date.now()}`;
+
+    // Ensure tenant is NOT in L1/L2 cache
+    const { tenantCache } = await import('../../src/shared/cache/tenant-cache.js');
+    await tenantCache.invalidateTenant(tenantId);
+
+    const rawPayload = {
+      event_id: eventId,
+      tenant_id: tenantId,
+      platform,
+      defer_count: 5,
+      data: JSON.stringify({
+        tenantId,
+        platform,
+        eventId,
+        entityType: 'ORDER',
+        entityId: 'ORD_COLD_DB',
+        eventType: 'orders/create',
+        currentState: 'CREATED',
+        stateWeight: 10,
+        externalVersion: Date.now(),
+        isHydrated: true,
+        payload: { order_id: 'ORD_COLD_DB' },
+        rawBody: '{}',
+        receivedAt: new Date().toISOString(),
+      }),
+    };
+
+    try {
+      const result = await processor.processEvent(
+        redis,
+        'webhooks:stream:00',
+        '1000000000000-0',
+        rawPayload,
+        deadPool
+      );
+
+      // Must NOT return SUCCESS (must not ACK)! Must fail retry so message stays in PEL
+      expect(result.status).toBe('FAILED_RETRY');
+      expect(result.error).toBe('DB_DOWN_CANNOT_DLQ');
+    } finally {
       await deadPool.end().catch(() => {});
     }
   });

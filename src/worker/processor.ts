@@ -10,7 +10,7 @@ import {
   dlqDepth,
 } from '../shared/observability/metrics.js';
 import { VerifiedWebhookEvent } from '../gateway/adapters/types.js';
-import { tenantCache } from '../shared/cache/tenant-cache.js';
+import { tenantCache, TenantConfig } from '../shared/cache/tenant-cache.js';
 import { acquireTenantSemaphore, releaseTenantSemaphore } from './locks/semaphore.js';
 import { acquireIdempotencyLock, finalizeIdempotencyLock } from './locks/idempotency.js';
 import { executeOccStateUpsert } from './state-machine/occ-state.js';
@@ -46,16 +46,19 @@ export function resolveDownstreamUrl(dbUrl: string | null | undefined, envOverri
 
 export class WebhookProcessor {
   private readonly workerId: string;
+  private readonly customPool?: pg.Pool;
 
-  constructor(workerId?: string) {
+  constructor(workerId?: string, customPool?: pg.Pool) {
     this.workerId = workerId || `worker_${process.pid}_${Math.random().toString(36).substring(2, 7)}`;
+    this.customPool = customPool;
   }
 
   async processEvent(
     redis: Redis,
     streamKey: string,
     messageId: string,
-    rawPayload: { event_id: string; tenant_id: string; platform: string; data: string; defer_count?: number }
+    rawPayload: { event_id: string; tenant_id: string; platform: string; data: string; defer_count?: number },
+    poolOverride?: pg.Pool
   ): Promise<ProcessEventResult> {
     const startTime = Date.now();
     let event: VerifiedWebhookEvent;
@@ -68,12 +71,19 @@ export class WebhookProcessor {
     }
 
     const { tenantId, platform, eventId } = event;
-    const pool = getDbPool();
+    const pool = poolOverride || this.customPool || getDbPool();
 
-    // 1. Fetch Tenant Configuration
-    const tenant = await tenantCache.getTenant(tenantId);
+    // 1. Fetch Tenant Configuration (Distinguish non-existent tenant vs database outage)
+    let tenant: TenantConfig | null;
+    try {
+      tenant = await tenantCache.getTenant(tenantId);
+    } catch (err: any) {
+      logger.error({ err, tenantId, eventId }, 'Failed to resolve tenant due to DB error, will retry without losing message');
+      throw err; // Caught by outer catch to preserve message in PEL and retry with backoff
+    }
+
     if (!tenant) {
-      logger.warn({ tenantId, eventId }, 'Skipping event for unknown tenant');
+      logger.warn({ tenantId, eventId }, 'Skipping event for non-existent tenant');
       return { status: 'SUCCESS', eventId, durationMs: Date.now() - startTime };
     }
 

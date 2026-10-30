@@ -46,7 +46,7 @@ export class ReconciliationSweeper {
             ON k.tenant_id = e.tenant_id AND k.platform = e.platform AND k.event_id = e.event_id
           WHERE k.status IN ('PERSISTED', 'IN_PROGRESS')
             AND k.updated_at < NOW() - INTERVAL '2 minutes'
-            AND e.delivery_status NOT IN ('DELIVERED', 'DLQ', 'RETRYING')
+            AND e.delivery_status NOT IN ('DELIVERED', 'DLQ')
           ORDER BY k.updated_at ASC
           LIMIT $1
           FOR UPDATE OF k SKIP LOCKED
@@ -104,7 +104,7 @@ export class ReconciliationSweeper {
       } catch (innerErr) {
         try {
           await client.query('ROLLBACK');
-        } catch {}
+        } catch { }
         throw innerErr;
       } finally {
         client.release();

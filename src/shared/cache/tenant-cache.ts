@@ -109,8 +109,8 @@ export class MultiTierTenantCache {
 
       return tenant;
     } catch (err) {
-      logger.error({ err, tenantId }, 'Failed to load tenant from PostgreSQL');
-      return null;
+      logger.error({ err, tenantId }, 'Failed to load tenant from PostgreSQL due to database error');
+      throw err;
     }
   }
 

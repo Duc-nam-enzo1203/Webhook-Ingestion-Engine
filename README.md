@@ -134,9 +134,14 @@ The engine includes authenticated operational endpoints for dead-letter queue ma
 
 ## 🚀 Quick Start
 
-### 1. Run with Docker Compose
+### 1. Configure Environment & Launch Stack
 ```bash
+# 1. Copy environment template
+cp .env.example .env
+
+# 2. Start full stack in Docker (Gateway, Worker, Postgres, Redis, Prometheus, Grafana)
 make up
+# or: docker compose up -d --build
 ```
 * **Gateway API:** `http://localhost:3000`
 * **Mock Downstream ERP:** `http://localhost:4000`

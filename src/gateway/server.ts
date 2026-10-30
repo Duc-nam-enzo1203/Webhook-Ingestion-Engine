@@ -250,7 +250,15 @@ export async function buildGatewayServer(): Promise<FastifyInstance> {
     }
 
     // 1. Multi-Tier Cache lookup (L1 -> L2 -> DB)
-    const tenant = await tenantCache.getTenant(tenantId);
+    let tenant;
+    try {
+      tenant = await tenantCache.getTenant(tenantId);
+    } catch (dbErr) {
+      logger.error({ err: dbErr, tenantId }, 'Database outage while resolving tenant in gateway');
+      gatewayRequestsTotal.inc({ platform, status: '503_db_unavailable' });
+      return reply.code(503).send({ error: 'Tenant configuration unavailable due to backend database error' });
+    }
+
     if (!tenant || !tenant.isActive) {
       gatewayRequestsTotal.inc({ platform, status: '403_inactive_tenant' });
       return reply.code(403).send({ error: 'Tenant is unknown or inactive' });
